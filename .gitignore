@@ -1,0 +1,27 @@
+# Local secrets and signing material
+.env
+.env.*
+*.p12
+*.pfx
+*.mobileprovision
+*.cer
+*.key
+*.pem
+cert_pass.txt
+account_pass.txt
+account_2fa.txt
+signer-cfg.yml
+
+# Signed/unsigned app payloads
+*.ipa
+Payload/
+apps/
+jobs/
+data/
+
+# Tool/editor noise
+.DS_Store
+.vscode/
+.idea/
+__pycache__/
+*.pyc
