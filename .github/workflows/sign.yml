@@ -1,0 +1,52 @@
+name: MOD X SignTools Builder
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: modx-signer
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      SECRET_URL: ${{ secrets.SECRET_URL }}
+      SECRET_KEY: ${{ secrets.SECRET_KEY }}
+      SIGNTOOLS_CI_COMMIT: 8790863e64148768be9e8320c361411580d52554
+    steps:
+      - name: Validate builder secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SECRET_URL" || { echo 'SECRET_URL is not configured'; exit 1; }
+          test -n "$SECRET_KEY" || { echo 'SECRET_KEY is not configured'; exit 1; }
+
+      - name: Cache Fastlane session
+        uses: actions/cache@v4
+        with:
+          path: ~/.fastlane
+          key: fastlane-session-${{ github.repository_id }}
+          restore-keys: |
+            fastlane-session-
+
+      - name: Checkout pinned SignTools CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/SignTools/SignTools-CI.git signtools-ci
+          cd signtools-ci
+          git checkout --detach "$SIGNTOOLS_CI_COMMIT"
+          test "$(git rev-parse HEAD)" = "$SIGNTOOLS_CI_COMMIT"
+          chmod +x insert_dylib
+
+      - name: Sign
+        shell: bash
+        working-directory: signtools-ci
+        run: |
+          set -euo pipefail
+          PYTHONUNBUFFERED=1 python3 sign.py
