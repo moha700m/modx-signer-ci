@@ -1,13 +1,26 @@
-name: MOD X SignTools Builder
+name: MOD X Signer
 
 on:
   workflow_dispatch:
+    inputs:
+      job_id:
+        description: Signing job ID
+        required: true
+        type: string
+      api_base:
+        description: MOD X Signer API base URL
+        required: true
+        type: string
+      worker_token:
+        description: One-time worker token
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: modx-signer
+  group: modx-signer-${{ inputs.job_id }}
   cancel-in-progress: false
 
 jobs:
@@ -15,38 +28,23 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 30
     env:
-      SECRET_URL: ${{ secrets.SECRET_URL }}
-      SECRET_KEY: ${{ secrets.SECRET_KEY }}
-      SIGNTOOLS_CI_COMMIT: 8790863e64148768be9e8320c361411580d52554
+      JOB_ID: ${{ inputs.job_id }}
+      API_BASE: ${{ inputs.api_base }}
+      WORKER_TOKEN: ${{ inputs.worker_token }}
     steps:
-      - name: Validate builder secrets
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate inputs
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$SECRET_URL" || { echo 'SECRET_URL is not configured'; exit 1; }
-          test -n "$SECRET_KEY" || { echo 'SECRET_KEY is not configured'; exit 1; }
+          test -n "$JOB_ID"
+          test -n "$API_BASE"
+          test -n "$WORKER_TOKEN"
 
-      - name: Cache Fastlane session
-        uses: actions/cache@v4
-        with:
-          path: ~/.fastlane
-          key: fastlane-session-${{ github.repository_id }}
-          restore-keys: |
-            fastlane-session-
-
-      - name: Checkout pinned SignTools CI
+      - name: Sign IPA
         shell: bash
         run: |
           set -euo pipefail
-          git clone --filter=blob:none https://github.com/SignTools/SignTools-CI.git signtools-ci
-          cd signtools-ci
-          git checkout --detach "$SIGNTOOLS_CI_COMMIT"
-          test "$(git rev-parse HEAD)" = "$SIGNTOOLS_CI_COMMIT"
-          chmod +x insert_dylib
-
-      - name: Sign
-        shell: bash
-        working-directory: signtools-ci
-        run: |
-          set -euo pipefail
-          PYTHONUNBUFFERED=1 python3 sign.py
+          PYTHONUNBUFFERED=1 python3 worker.py
