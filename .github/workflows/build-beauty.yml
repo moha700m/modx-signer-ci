@@ -1,0 +1,81 @@
+name: Build MOD X Beauty Filters
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'ios-beauty/AladBeautyFilters.m'
+      - '.github/workflows/build-beauty.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build arm64 iOS dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ios-beauty/build
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -fmodules \
+            -dynamiclib \
+            -isysroot "$SDK" \
+            -framework UIKit \
+            -framework AVFoundation \
+            -framework CoreImage \
+            -framework CoreMedia \
+            -framework CoreVideo \
+            -framework CoreGraphics \
+            -framework ImageIO \
+            -framework Vision \
+            -framework QuartzCore \
+            -Wl,-undefined,dynamic_lookup \
+            -Wl,-install_name,@executable_path/AladBeautyFilters.dylib \
+            ios-beauty/AladBeautyFilters.m \
+            -o ios-beauty/build/AladBeautyFilters.dylib
+
+      - name: Validate dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          file ios-beauty/build/AladBeautyFilters.dylib | tee ios-beauty/build/file.txt
+          file ios-beauty/build/AladBeautyFilters.dylib | grep -q 'Mach-O 64-bit arm64'
+          otool -D ios-beauty/build/AladBeautyFilters.dylib | tee ios-beauty/build/install-name.txt
+          otool -D ios-beauty/build/AladBeautyFilters.dylib | grep -q '@executable_path/AladBeautyFilters.dylib'
+          nm -u ios-beauty/build/AladBeautyFilters.dylib | grep -q 'MSHookMessageEx'
+          strings ios-beauty/build/AladBeautyFilters.dylib | grep -q 'MOD X Beauty'
+          shasum -a 256 ios-beauty/build/AladBeautyFilters.dylib | tee ios-beauty/build/sha256.txt
+
+      - name: Encode build for retrieval
+        shell: bash
+        run: |
+          set -euo pipefail
+          gzip -9 -c ios-beauty/build/AladBeautyFilters.dylib | base64 > ios-beauty/build/AladBeautyFilters.dylib.gz.b64
+          rm ios-beauty/build/AladBeautyFilters.dylib
+
+      - name: Commit verified build
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add ios-beauty/build
+          if git diff --cached --quiet; then
+            echo 'Build output unchanged.'
+            exit 0
+          fi
+          git commit -m 'build: compile MOD X beauty filters [skip ci]'
+          git push
