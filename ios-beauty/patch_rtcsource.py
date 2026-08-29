@@ -13,11 +13,11 @@ if marker not in src:
 head = src.split(marker, 1)[0]
 head = head.replace('#import <objc/runtime.h>', '#import <objc/runtime.h>\n#import <objc/message.h>')
 
-runtime = r'''// MARK: - Runtime hook (Cydia Substrate) — safe RTCVideoSource path
+runtime = r'''// MARK: - Runtime hook — safe RTCVideoSource path
 
-// Do NOT hook RTCCameraVideoCapturer or replace AVCapture callbacks here.
-// MiniChat must receive its original camera sample buffers unchanged. We only
-// replace the RTCVideoFrame after WebRTC has accepted the camera frame.
+// Camera safety rule: never hook RTCCameraVideoCapturer and never replace the
+// AVCapture CMSampleBuffer. MiniChat receives its normal camera pipeline.
+// Filtering occurs one layer later at RTCVideoSource. Failure is fail-open.
 
 typedef void (*ALRTCVideoSourceFrameIMP)(id, SEL, id, id);
 static ALRTCVideoSourceFrameIMP gALOriginalRTCVideoSourceFrame = NULL;
@@ -27,8 +27,9 @@ static CMSampleBufferRef ALCreateSampleBufferForPixelBuffer(CVPixelBufferRef pix
     if (!pixelBuffer) return NULL;
 
     CMVideoFormatDescriptionRef format = NULL;
-    OSStatus fs = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &format);
-    if (fs != noErr || !format) return NULL;
+    if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &format) != noErr || !format) {
+        return NULL;
+    }
 
     CMSampleTimingInfo timing = {
         .duration = kCMTimeInvalid,
@@ -37,13 +38,13 @@ static CMSampleBufferRef ALCreateSampleBufferForPixelBuffer(CVPixelBufferRef pix
     };
 
     CMSampleBufferRef sample = NULL;
-    OSStatus ss = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault,
-                                                            pixelBuffer,
-                                                            format,
-                                                            &timing,
-                                                            &sample);
+    OSStatus status = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault,
+                                                                pixelBuffer,
+                                                                format,
+                                                                &timing,
+                                                                &sample);
     CFRelease(format);
-    if (ss != noErr) {
+    if (status != noErr) {
         if (sample) CFRelease(sample);
         return NULL;
     }
@@ -57,13 +58,11 @@ static id ALFilteredRTCFrame(id frame) {
 
     SEL bufferSel = sel_registerName("buffer");
     if (![frame respondsToSelector:bufferSel]) return nil;
-
     id bufferObj = ((id (*)(id, SEL))objc_msgSend)(frame, bufferSel);
     if (!bufferObj) return nil;
 
     SEL pixelSel = sel_registerName("pixelBuffer");
     if (![bufferObj respondsToSelector:pixelSel]) return nil;
-
     CVPixelBufferRef inputPixelBuffer = ((CVPixelBufferRef (*)(id, SEL))objc_msgSend)(bufferObj, pixelSel);
     if (!inputPixelBuffer) return nil;
 
@@ -73,7 +72,6 @@ static id ALFilteredRTCFrame(id frame) {
     CMSampleBufferRef processedSample = [[ALBeautyFilterEngine sharedEngine]
         processedSampleBufferFromSampleBuffer:inputSample];
     CFRelease(inputSample);
-
     if (!processedSample) return nil;
 
     CVPixelBufferRef processedPixelBuffer = CMSampleBufferGetImageBuffer(processedSample);
@@ -112,18 +110,18 @@ static id ALFilteredRTCFrame(id frame) {
     }
 
     id frameAlloc = ((id (*)(id, SEL))objc_msgSend)(videoFrameClass, sel_registerName("alloc"));
-    id filteredFrame = ((id (*)(id, SEL, id, NSInteger, int64_t))objc_msgSend)(
+    return ((id (*)(id, SEL, id, NSInteger, int64_t))objc_msgSend)(
         frameAlloc,
         sel_registerName("initWithBuffer:rotation:timeStampNs:"),
         rtcBuffer,
         rotation,
         timeStampNs
     );
-    return filteredFrame;
 }
 
 static void ALRTCVideoSourceFrameHook(id self, SEL _cmd, id capturer, id frame) {
-    if (!gALOriginalRTCVideoSourceFrame) return;
+    ALRTCVideoSourceFrameIMP original = gALOriginalRTCVideoSourceFrame;
+    if (!original) return;
 
     NSNumber *active = objc_getAssociatedObject(self, kALRTCSourceActiveKey);
     if (!active.boolValue) {
@@ -132,31 +130,40 @@ static void ALRTCVideoSourceFrameHook(id self, SEL _cmd, id capturer, id frame) 
         NSLog(@"[MOD X Beauty] RTCVideoSource stream detected");
     }
 
-    id filteredFrame = ALFilteredRTCFrame(frame);
-    gALOriginalRTCVideoSourceFrame(self, _cmd, capturer, filteredFrame ?: frame);
+    id filteredFrame = nil;
+    @try {
+        filteredFrame = ALFilteredRTCFrame(frame);
+    } @catch (NSException *exception) {
+        NSLog(@"[MOD X Beauty] filter exception; original frame preserved: %@", exception.reason);
+    }
+
+    original(self, _cmd, capturer, filteredFrame ?: frame);
 }
 
 __attribute__((constructor)) static void ALBeautyFiltersInit(void) {
     @autoreleasepool {
-        NSString *bundleIdentifier = NSBundle.mainBundle.bundleIdentifier;
-        if (![bundleIdentifier isEqualToString:@"com.minichat"]) {
-            return;
-        }
+        if (![NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.minichat"]) return;
 
         Class sourceClass = objc_getClass("RTCVideoSource");
         SEL selector = sel_registerName("capturer:didCaptureVideoFrame:");
-        if (sourceClass && class_getInstanceMethod(sourceClass, selector)) {
-            MSHookMessageEx(sourceClass,
-                            selector,
-                            (IMP)ALRTCVideoSourceFrameHook,
-                            (IMP *)&gALOriginalRTCVideoSourceFrame);
-            NSLog(@"[MOD X Beauty] safe RTCVideoSource hook installed");
+        Method method = sourceClass ? class_getInstanceMethod(sourceClass, selector) : NULL;
+
+        if (method) {
+            IMP original = method_getImplementation(method);
+            if (original && original != (IMP)ALRTCVideoSourceFrameHook) {
+                gALOriginalRTCVideoSourceFrame = (ALRTCVideoSourceFrameIMP)original;
+                method_setImplementation(method, (IMP)ALRTCVideoSourceFrameHook);
+                NSLog(@"[MOD X Beauty] safe RTCVideoSource swizzle installed");
+            }
         } else {
-            NSLog(@"[MOD X Beauty] RTCVideoSource hook target not found");
+            NSLog(@"[MOD X Beauty] RTCVideoSource target not found");
         }
 
-        dispatch_async(dispatch_get_main_queue(), ^{
-            (void)[ALFilterController sharedController];
+        // Keep the control accessible even if capture objects were created
+        // before this dylib initialized. This does not touch the camera.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [[ALFilterController sharedController] captureDidStart];
         });
     }
 }
