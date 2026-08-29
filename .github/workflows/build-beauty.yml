@@ -28,8 +28,19 @@ jobs:
           python3 ios-beauty/patch_rtcsource.py \
             ios-beauty/AladBeautyFilters.m \
             ios-beauty/AladBeautyFiltersRTCSource.m
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ios-beauty/AladBeautyFiltersRTCSource.m')
+          s = p.read_text()
+          needle = 'if (![NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.minichat"]) return;\n\n        Class sourceClass'
+          replacement = 'if (![NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.minichat"]) return;\n\n        // Always boot with filtering OFF so a stale saved selection can never black out camera startup.\n        [ALBeautyFilterEngine sharedEngine].style = ALBeautyFilterStyleNone;\n        [[NSUserDefaults standardUserDefaults] setInteger:ALBeautyFilterStyleNone forKey:kALSelectedFilterKey];\n\n        Class sourceClass'
+          if needle not in s:
+              raise SystemExit('constructor insertion point not found')
+          p.write_text(s.replace(needle, replacement, 1))
+          PY
           grep -q 'safe RTCVideoSource swizzle installed' ios-beauty/AladBeautyFiltersRTCSource.m
           grep -q 'capturer:didCaptureVideoFrame:' ios-beauty/AladBeautyFiltersRTCSource.m
+          grep -q 'Always boot with filtering OFF' ios-beauty/AladBeautyFiltersRTCSource.m
 
       - name: Build arm64 iOS dylib
         shell: bash
