@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - 'ios-beauty/AladBeautyFilters.m'
+      - 'ios-beauty/patch_webrtc.py'
       - '.github/workflows/build-beauty.yml'
 
 permissions:
@@ -19,6 +20,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Prepare direct WebRTC source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ios-beauty/patch_webrtc.py \
+            ios-beauty/AladBeautyFilters.m \
+            ios-beauty/AladBeautyFiltersWebRTC.m
+          grep -q 'direct WebRTC frame hook installed' ios-beauty/AladBeautyFiltersWebRTC.m
+          grep -q 'RTCCameraVideoCapturer' ios-beauty/AladBeautyFiltersWebRTC.m
 
       - name: Build arm64 iOS dylib
         shell: bash
@@ -44,7 +55,7 @@ jobs:
             -framework QuartzCore \
             -Wl,-undefined,dynamic_lookup \
             -Wl,-install_name,@executable_path/AladBeautyFilters.dylib \
-            ios-beauty/AladBeautyFilters.m \
+            ios-beauty/AladBeautyFiltersWebRTC.m \
             -o ios-beauty/build/AladBeautyFilters.dylib
 
       - name: Validate dylib
@@ -56,7 +67,8 @@ jobs:
           otool -D ios-beauty/build/AladBeautyFilters.dylib | tee ios-beauty/build/install-name.txt
           otool -D ios-beauty/build/AladBeautyFilters.dylib | grep -q '@executable_path/AladBeautyFilters.dylib'
           nm -u ios-beauty/build/AladBeautyFilters.dylib | grep -q 'MSHookMessageEx'
-          strings ios-beauty/build/AladBeautyFilters.dylib | grep -q 'MOD X Beauty'
+          strings ios-beauty/build/AladBeautyFilters.dylib | grep -q 'direct WebRTC frame hook installed'
+          strings ios-beauty/build/AladBeautyFilters.dylib | grep -q 'RTCCameraVideoCapturer'
           shasum -a 256 ios-beauty/build/AladBeautyFilters.dylib | tee ios-beauty/build/sha256.txt
 
       - name: Upload verified dylib artifact
@@ -73,6 +85,7 @@ jobs:
           set -euo pipefail
           gzip -9 -c ios-beauty/build/AladBeautyFilters.dylib | base64 > ios-beauty/build/AladBeautyFilters.dylib.gz.b64
           rm ios-beauty/build/AladBeautyFilters.dylib
+          rm -f ios-beauty/AladBeautyFiltersWebRTC.m
 
       - name: Commit verified build metadata
         shell: bash
