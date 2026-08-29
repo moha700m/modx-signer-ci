@@ -21,15 +21,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare direct WebRTC source
+      - name: Prepare WebRTC-safe source
         shell: bash
         run: |
           set -euo pipefail
           python3 ios-beauty/patch_webrtc.py \
             ios-beauty/AladBeautyFilters.m \
             ios-beauty/AladBeautyFiltersWebRTC.m
-          grep -q 'direct WebRTC frame hook installed' ios-beauty/AladBeautyFiltersWebRTC.m
+          grep -q 'WebRTC-safe frame hook installed' ios-beauty/AladBeautyFiltersWebRTC.m
           grep -q 'RTCCameraVideoCapturer' ios-beauty/AladBeautyFiltersWebRTC.m
+          grep -q 'ALCopyPixelBufferPixels' ios-beauty/AladBeautyFiltersWebRTC.m
 
       - name: Build arm64 iOS dylib
         shell: bash
@@ -67,7 +68,7 @@ jobs:
           otool -D ios-beauty/build/AladBeautyFilters.dylib | tee ios-beauty/build/install-name.txt
           otool -D ios-beauty/build/AladBeautyFilters.dylib | grep -q '@executable_path/AladBeautyFilters.dylib'
           nm -u ios-beauty/build/AladBeautyFilters.dylib | grep -q 'MSHookMessageEx'
-          strings ios-beauty/build/AladBeautyFilters.dylib | grep -q 'direct WebRTC frame hook installed'
+          strings ios-beauty/build/AladBeautyFilters.dylib | grep -q 'WebRTC-safe frame hook installed'
           strings ios-beauty/build/AladBeautyFilters.dylib | grep -q 'RTCCameraVideoCapturer'
           shasum -a 256 ios-beauty/build/AladBeautyFilters.dylib | tee ios-beauty/build/sha256.txt
 
