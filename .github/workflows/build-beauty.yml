@@ -7,7 +7,7 @@ on:
       - main
     paths:
       - 'ios-beauty/AladBeautyFilters.m'
-      - 'ios-beauty/patch_webrtc.py'
+      - 'ios-beauty/patch_rtcsource.py'
       - '.github/workflows/build-beauty.yml'
 
 permissions:
@@ -21,16 +21,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare WebRTC-safe source
+      - name: Prepare safe RTCVideoSource source
         shell: bash
         run: |
           set -euo pipefail
-          python3 ios-beauty/patch_webrtc.py \
+          python3 ios-beauty/patch_rtcsource.py \
             ios-beauty/AladBeautyFilters.m \
-            ios-beauty/AladBeautyFiltersWebRTC.m
-          grep -q 'WebRTC-safe frame hook installed' ios-beauty/AladBeautyFiltersWebRTC.m
-          grep -q 'RTCCameraVideoCapturer' ios-beauty/AladBeautyFiltersWebRTC.m
-          grep -q 'ALCopyPixelBufferPixels' ios-beauty/AladBeautyFiltersWebRTC.m
+            ios-beauty/AladBeautyFiltersRTCSource.m
+          grep -q 'safe RTCVideoSource swizzle installed' ios-beauty/AladBeautyFiltersRTCSource.m
+          grep -q 'capturer:didCaptureVideoFrame:' ios-beauty/AladBeautyFiltersRTCSource.m
 
       - name: Build arm64 iOS dylib
         shell: bash
@@ -56,7 +55,7 @@ jobs:
             -framework QuartzCore \
             -Wl,-undefined,dynamic_lookup \
             -Wl,-install_name,@executable_path/AladBeautyFilters.dylib \
-            ios-beauty/AladBeautyFiltersWebRTC.m \
+            ios-beauty/AladBeautyFiltersRTCSource.m \
             -o ios-beauty/build/AladBeautyFilters.dylib
 
       - name: Validate dylib
@@ -67,9 +66,10 @@ jobs:
           file ios-beauty/build/AladBeautyFilters.dylib | grep -Eq 'Mach-O 64-bit.*arm64'
           otool -D ios-beauty/build/AladBeautyFilters.dylib | tee ios-beauty/build/install-name.txt
           otool -D ios-beauty/build/AladBeautyFilters.dylib | grep -q '@executable_path/AladBeautyFilters.dylib'
-          nm -u ios-beauty/build/AladBeautyFilters.dylib | grep -q 'MSHookMessageEx'
-          strings ios-beauty/build/AladBeautyFilters.dylib | grep -q 'WebRTC-safe frame hook installed'
-          strings ios-beauty/build/AladBeautyFilters.dylib | grep -q 'RTCCameraVideoCapturer'
+          strings ios-beauty/build/AladBeautyFilters.dylib | grep -q 'safe RTCVideoSource swizzle installed'
+          strings ios-beauty/build/AladBeautyFilters.dylib | grep -q 'RTCVideoSource'
+          strings ios-beauty/build/AladBeautyFilters.dylib | grep -q 'RTCCVPixelBuffer'
+          strings ios-beauty/build/AladBeautyFilters.dylib | grep -q 'RTCVideoFrame'
           shasum -a 256 ios-beauty/build/AladBeautyFilters.dylib | tee ios-beauty/build/sha256.txt
 
       - name: Upload verified dylib artifact
@@ -86,7 +86,7 @@ jobs:
           set -euo pipefail
           gzip -9 -c ios-beauty/build/AladBeautyFilters.dylib | base64 > ios-beauty/build/AladBeautyFilters.dylib.gz.b64
           rm ios-beauty/build/AladBeautyFilters.dylib
-          rm -f ios-beauty/AladBeautyFiltersWebRTC.m
+          rm -f ios-beauty/AladBeautyFiltersRTCSource.m
 
       - name: Commit verified build metadata
         shell: bash
