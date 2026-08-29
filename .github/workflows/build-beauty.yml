@@ -52,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           file ios-beauty/build/AladBeautyFilters.dylib | tee ios-beauty/build/file.txt
-          file ios-beauty/build/AladBeautyFilters.dylib | grep -q 'Mach-O 64-bit arm64'
+          file ios-beauty/build/AladBeautyFilters.dylib | grep -Eq 'Mach-O 64-bit.*arm64'
           otool -D ios-beauty/build/AladBeautyFilters.dylib | tee ios-beauty/build/install-name.txt
           otool -D ios-beauty/build/AladBeautyFilters.dylib | grep -q '@executable_path/AladBeautyFilters.dylib'
           nm -u ios-beauty/build/AladBeautyFilters.dylib | grep -q 'MSHookMessageEx'
