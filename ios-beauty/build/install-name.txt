@@ -1,0 +1,2 @@
+ios-beauty/build/AladBeautyFilters.dylib:
+@executable_path/AladBeautyFilters.dylib

@@ -1,0 +1,1 @@
+ios-beauty/build/AladBeautyFilters.dylib: Mach-O 64-bit dynamically linked shared library arm64
