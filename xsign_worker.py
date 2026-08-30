@@ -12,7 +12,6 @@ import secrets as pysecrets
 import shutil
 import subprocess
 import tempfile
-import time
 import urllib.parse
 import urllib.request
 import zipfile
@@ -20,12 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import jwt
 import requests
 
 CHUNK_SIZE = 384 * 1024
-APPLE_API = 'https://api.appstoreconnect.apple.com'
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
+WORKER_VERSION = '3.0.0'
 
 
 class WorkerError(RuntimeError):
@@ -35,7 +33,7 @@ class WorkerError(RuntimeError):
 def required_env(name: str) -> str:
     value = os.environ.get(name, '').strip()
     if not value:
-        raise WorkerError(f'Missing required secret/environment value: {name}')
+        raise WorkerError(f'Missing required environment value: {name}')
     return value
 
 
@@ -52,7 +50,7 @@ def run(args: list[str], *, cwd: Path | None = None, capture: bool = True) -> st
         stderr = (proc.stderr or '').strip()
         stdout = (proc.stdout or '').strip()
         detail = stderr or stdout or f'exit code {proc.returncode}'
-        raise WorkerError(f"{' '.join(args[:4])} failed: {detail[:1600]}")
+        raise WorkerError(f"{' '.join(args[:5])} failed: {detail[:1800]}")
     return (proc.stdout or '').strip()
 
 
@@ -61,7 +59,10 @@ def github_oidc_token() -> str:
     request_token = required_env('ACTIONS_ID_TOKEN_REQUEST_TOKEN')
     separator = '&' if '?' in request_url else '?'
     url = f'{request_url}{separator}audience={urllib.parse.quote("xsign-worker")}'
-    req = urllib.request.Request(url, headers={'Authorization': f'Bearer {request_token}', 'Accept': 'application/json'})
+    req = urllib.request.Request(
+        url,
+        headers={'Authorization': f'Bearer {request_token}', 'Accept': 'application/json'},
+    )
     with urllib.request.urlopen(req, timeout=30) as response:
         payload = json.loads(response.read().decode('utf-8'))
     token = str(payload.get('value', '')).strip()
@@ -74,30 +75,47 @@ class XSignClient:
     def __init__(self) -> None:
         self.base = os.environ.get('XSIGN_BASE_URL', 'https://xsign-0xcfp9.v2.appdeploy.ai').rstrip('/')
         self.s = requests.Session()
-        self.s.headers.update({'Authorization': f'Bearer {github_oidc_token()}', 'User-Agent': 'XSign-GitHub-Worker/2.0'})
+        self.s.headers.update({
+            'Authorization': f'Bearer {github_oidc_token()}',
+            'User-Agent': f'XSign-GitHub-Worker/{WORKER_VERSION}',
+        })
 
-    def request(self, method: str, path: str, *, json_body: dict[str, Any] | None = None) -> dict[str, Any]:
-        r = self.s.request(method, f'{self.base}{path}', json=json_body, timeout=90)
+    def _decode(self, response: requests.Response) -> dict[str, Any]:
         try:
-            data = r.json()
+            data = response.json()
         except Exception:
-            data = {'error': r.text[:1000]}
-        if not r.ok:
-            raise WorkerError(f'XSign {method} {path} -> {r.status_code}: {data}')
+            data = {'error': response.text[:1000]}
+        if not isinstance(data, dict):
+            return {'data': data}
         return data
 
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        allow_statuses: tuple[int, ...] = (),
+    ) -> tuple[int, dict[str, Any]]:
+        r = self.s.request(method, f'{self.base}{path}', json=json_body, timeout=120)
+        data = self._decode(r)
+        if not r.ok and r.status_code not in allow_statuses:
+            raise WorkerError(f'XSign {method} {path} -> {r.status_code}: {data}')
+        return r.status_code, data
+
     def heartbeat(self) -> None:
-        self.request('POST', '/api/worker/heartbeat', json_body={'workerId': 'github-macos', 'version': '2.0.0'})
+        self.request('POST', '/api/worker/heartbeat', json_body={'workerId': 'github-macos', 'version': WORKER_VERSION})
 
     def claim(self) -> dict[str, Any] | None:
-        return self.request('POST', '/api/worker/claim', json_body={}).get('job')
+        _, data = self.request('POST', '/api/worker/claim', json_body={})
+        return data.get('job')
 
     def status(self, job_id: str, status: str, message: str) -> None:
         self.request('POST', f'/api/worker/jobs/{job_id}/status', json_body={'status': status, 'message': message})
 
     def input_chunk(self, job_id: str, index: int) -> bytes:
-        data = self.request('GET', f'/api/worker/jobs/{job_id}/input/{index}')
-        return base64.b64decode(data['content'], validate=True)
+        _, data = self.request('GET', f'/api/worker/jobs/{job_id}/input/{index}')
+        return base64.b64decode(str(data['content']), validate=True)
 
     def output_chunk(self, job_id: str, index: int, content: bytes) -> None:
         self.request(
@@ -118,108 +136,65 @@ class XSignClient:
         except Exception as exc:
             print(f'Could not report failure to XSign: {exc}')
 
-
-class AppleClient:
-    def __init__(self) -> None:
-        self.issuer = required_env('APPLE_ISSUER_ID')
-        self.key_id = required_env('APPLE_KEY_ID')
-        try:
-            self.private_key = base64.b64decode(required_env('APPLE_PRIVATE_KEY_P8_B64'), validate=True).decode('utf-8')
-        except Exception as exc:
-            raise WorkerError('APPLE_PRIVATE_KEY_P8_B64 is not valid base64-encoded P8 content.') from exc
-        self.s = requests.Session()
-
-    def token(self) -> str:
-        now = int(time.time())
-        return jwt.encode(
-            {'iss': self.issuer, 'iat': now, 'exp': now + 900, 'aud': 'appstoreconnect-v1'},
-            self.private_key,
-            algorithm='ES256',
-            headers={'kid': self.key_id, 'typ': 'JWT'},
-        )
-
-    def request(self, method: str, path: str, *, params: dict[str, str] | None = None, body: dict[str, Any] | None = None) -> dict[str, Any]:
-        headers = {'Authorization': f'Bearer {self.token()}', 'Content-Type': 'application/json'}
-        r = self.s.request(method, f'{APPLE_API}{path}', params=params, json=body, headers=headers, timeout=90)
-        try:
-            data = r.json()
-        except Exception:
-            data = {'raw': r.text[:1000]}
-        if not r.ok:
-            errors = data.get('errors') if isinstance(data, dict) else None
-            raise WorkerError(f'Apple API {method} {path} -> {r.status_code}: {errors or data}')
+    def apple(self, action: str, **kwargs: Any) -> dict[str, Any]:
+        _, data = self.request('POST', '/api/worker/apple', json_body={'action': action, **kwargs})
         return data
 
-    def get_or_register_device(self, udid: str, name: str) -> str:
-        data = self.request('GET', '/v1/devices', params={'filter[udid]': udid, 'limit': '10'})
-        devices = data.get('data', [])
-        if devices:
-            device = devices[0]
-            attrs = device.get('attributes', {})
-            if attrs.get('status') == 'DISABLED':
-                raise WorkerError('This UDID exists in Apple Developer but is disabled.')
-            return device['id']
-        body = {'data': {'type': 'devices', 'attributes': {'name': name[:50] or 'XSign iPhone', 'platform': 'IOS', 'udid': udid}}}
-        return self.request('POST', '/v1/devices', body=body)['data']['id']
+    def get_signing_identity(self) -> dict[str, str] | None:
+        status, data = self.request('GET', '/api/worker/signing-identity', allow_statuses=(503, 404))
+        if status in (503, 404):
+            return None
+        p12_b64 = str(data.get('p12B64', ''))
+        password = str(data.get('password', ''))
+        if not p12_b64:
+            return None
+        return {'p12B64': p12_b64, 'password': password}
 
-    def get_or_create_bundle_id(self, bundle_id: str, display_name: str) -> str:
-        data = self.request('GET', '/v1/bundleIds', params={'filter[identifier]': bundle_id, 'limit': '10'})
-        items = data.get('data', [])
-        if items:
-            return items[0]['id']
-        safe_name = re.sub(r'[^A-Za-z0-9 ._-]+', '-', display_name).strip() or 'XSign App'
-        body = {
-            'data': {
-                'type': 'bundleIds',
-                'attributes': {'identifier': bundle_id, 'name': f'XSign {safe_name}'[:100], 'platform': 'IOS'},
-            }
-        }
-        return self.request('POST', '/v1/bundleIds', body=body)['data']['id']
+    def save_signing_identity(self, p12_b64: str, password: str) -> None:
+        self.request(
+            'POST',
+            '/api/worker/signing-identity',
+            json_body={'p12B64': p12_b64, 'password': password},
+        )
 
-    def ensure_capability(self, bundle_resource_id: str, capability_type: str) -> None:
-        data = self.request('GET', f'/v1/bundleIds/{bundle_resource_id}/bundleIdCapabilities', params={'limit': '200'})
-        for item in data.get('data', []):
-            if item.get('attributes', {}).get('capabilityType') == capability_type:
-                return
-        body = {
-            'data': {
-                'type': 'bundleIdCapabilities',
-                'attributes': {'capabilityType': capability_type},
-                'relationships': {'bundleId': {'data': {'type': 'bundleIds', 'id': bundle_resource_id}}},
-            }
-        }
-        self.request('POST', '/v1/bundleIdCapabilities', body=body)
+
+class AppleClient:
+    def __init__(self, xs: XSignClient) -> None:
+        self.xs = xs
+
+    def create_distribution_certificate(self, csr_content: str) -> dict[str, Any]:
+        return self.xs.apple('certificate.create', csrContent=csr_content)
 
     def certificate_id_for_serial(self, serial: str) -> str:
-        candidates = [serial.upper().lstrip('0'), serial.upper()]
-        for candidate in dict.fromkeys(candidates):
-            data = self.request('GET', '/v1/certificates', params={'filter[serialNumber]': candidate, 'limit': '10'})
-            items = [x for x in data.get('data', []) if x.get('attributes', {}).get('activated', True)]
-            if items:
-                return items[0]['id']
-        raise WorkerError(f'Apple Distribution certificate serial {serial} was not found in this developer team.')
+        return str(self.xs.apple('certificate.lookup', serial=serial)['id'])
 
-    def get_or_create_profile(self, name: str, bundle_resource: str, device_resource: str, certificate_resource: str) -> tuple[bytes, str | None]:
-        data = self.request('GET', '/v1/profiles', params={'filter[name]': name, 'limit': '10'})
-        for item in data.get('data', []):
-            attrs = item.get('attributes', {})
-            content = attrs.get('profileContent')
-            if content and attrs.get('profileState') != 'INVALID':
-                return base64.b64decode(content), attrs.get('expirationDate')
-        body = {
-            'data': {
-                'type': 'profiles',
-                'attributes': {'name': name[:100], 'profileType': 'IOS_APP_ADHOC'},
-                'relationships': {
-                    'bundleId': {'data': {'type': 'bundleIds', 'id': bundle_resource}},
-                    'devices': {'data': [{'type': 'devices', 'id': device_resource}]},
-                    'certificates': {'data': [{'type': 'certificates', 'id': certificate_resource}]},
-                },
-            }
-        }
-        data = self.request('POST', '/v1/profiles', body=body)['data']
-        attrs = data['attributes']
-        return base64.b64decode(attrs['profileContent']), attrs.get('expirationDate')
+    def get_or_register_device(self, udid: str, name: str) -> str:
+        return str(self.xs.apple('device.ensure', udid=udid, name=name)['id'])
+
+    def get_or_create_bundle_id(self, bundle_id: str, display_name: str) -> str:
+        return str(self.xs.apple('bundle.ensure', identifier=bundle_id, name=display_name)['id'])
+
+    def ensure_capability(self, bundle_resource_id: str, capability_type: str) -> None:
+        self.xs.apple('capability.ensure', bundleId=bundle_resource_id, capabilityType=capability_type)
+
+    def get_or_create_profile(
+        self,
+        name: str,
+        bundle_resource: str,
+        device_resource: str,
+        certificate_resource: str,
+    ) -> tuple[bytes, str | None]:
+        data = self.xs.apple(
+            'profile.ensure',
+            name=name,
+            bundleId=bundle_resource,
+            deviceId=device_resource,
+            certificateId=certificate_resource,
+        )
+        content = str(data.get('profileContent', ''))
+        if not content:
+            raise WorkerError('Apple did not return provisioning profile content.')
+        return base64.b64decode(content), data.get('expirationDate')
 
 
 def safe_extract(ipa: Path, dest: Path) -> None:
@@ -298,22 +273,16 @@ def inspect_and_remap(ipa: Path, work: Path, bundle_prefix: str) -> tuple[Path, 
     prefix = re.sub(r'[^A-Za-z0-9.-]+', '', bundle_prefix.strip()).strip('.')
     if prefix.count('.') < 1:
         raise WorkerError('APPLE_BUNDLE_PREFIX must be a reverse-DNS prefix such as com.example.xsign.')
-    if original_main.startswith(prefix + '.'):
-        new_main = original_main
-    else:
-        base = slug(original_main.split('.')[-1] or app.stem, 'app')
-        new_main = f'{prefix}.{base}'
+    new_main = original_main if original_main.startswith(prefix + '.') else f'{prefix}.{slug(original_main.split(".")[-1] or app.stem, "app")}'
 
     extension_dirs = sorted(app.glob('PlugIns/*.appex'))
     has_notification_service = False
-    specs: list[BundleSpec] = []
     ext_infos: list[tuple[Path, Path, dict[str, Any], str, str]] = []
     for ext in extension_dirs:
         info_path, info = read_info(ext)
         original_id = str(info.get('CFBundleIdentifier', '')).strip()
         if not original_id:
             raise WorkerError(f'{ext.name} CFBundleIdentifier is missing.')
-        ext_name = str(info.get('CFBundleDisplayName') or info.get('CFBundleName') or ext.stem).strip()
         if original_id.startswith(original_main + '.'):
             suffix = original_id[len(original_main) + 1:]
         else:
@@ -321,22 +290,20 @@ def inspect_and_remap(ipa: Path, work: Path, bundle_prefix: str) -> tuple[Path, 
         suffix = '.'.join(slug(part, 'ext') for part in suffix.split('.'))
         new_id = f'{new_main}.{suffix}'
         point = str((info.get('NSExtension') or {}).get('NSExtensionPointIdentifier', ''))
-        if point == 'com.apple.usernotifications.service':
-            has_notification_service = True
+        has_notification_service = has_notification_service or point == 'com.apple.usernotifications.service'
         ext_infos.append((ext, info_path, info, original_id, new_id))
 
     background_modes = main_info.get('UIBackgroundModes') or []
     main_needs_push = has_notification_service or 'remote-notification' in background_modes
     main_info['CFBundleIdentifier'] = new_main
     write_info(main_info_path, main_info)
-    specs.append(BundleSpec(app, main_info_path, original_main, new_main, display_name, False, main_needs_push))
 
+    specs = [BundleSpec(app, main_info_path, original_main, new_main, display_name, False, main_needs_push)]
     mapping = {original_main: new_main}
     for ext, info_path, info, original_id, new_id in ext_infos:
         info['CFBundleIdentifier'] = new_id
-        for key in ('WKCompanionAppBundleIdentifier',):
-            if info.get(key) in mapping:
-                info[key] = mapping[info[key]]
+        if info.get('WKCompanionAppBundleIdentifier') in mapping:
+            info['WKCompanionAppBundleIdentifier'] = mapping[info['WKCompanionAppBundleIdentifier']]
         write_info(info_path, info)
         mapping[original_id] = new_id
         ext_name = str(info.get('CFBundleDisplayName') or info.get('CFBundleName') or ext.stem).strip()
@@ -345,11 +312,45 @@ def inspect_and_remap(ipa: Path, work: Path, bundle_prefix: str) -> tuple[Path, 
     return app, specs
 
 
-def decode_secret_file(name: str, output: Path) -> None:
+def write_b64_file(value: str, output: Path, label: str) -> None:
     try:
-        output.write_bytes(base64.b64decode(required_env(name), validate=True))
+        output.write_bytes(base64.b64decode(value, validate=True))
     except Exception as exc:
-        raise WorkerError(f'{name} is not valid base64.') from exc
+        raise WorkerError(f'{label} is not valid base64.') from exc
+
+
+def bootstrap_signing_identity(xs: XSignClient, apple: AppleClient, p12: Path, work: Path) -> str:
+    existing = xs.get_signing_identity()
+    if existing:
+        write_b64_file(existing['p12B64'], p12, 'Stored signing identity')
+        return existing['password']
+
+    print('No persisted signing identity found; creating one through Apple API.')
+    private_key = work / 'distribution-private.pem'
+    csr = work / 'distribution.csr'
+    cert_der = work / 'distribution.cer'
+    cert_pem = work / 'distribution.pem'
+    password = pysecrets.token_urlsafe(36)
+
+    run(['openssl', 'genrsa', '-out', str(private_key), '2048'])
+    run([
+        'openssl', 'req', '-new', '-key', str(private_key), '-out', str(csr),
+        '-subj', '/CN=XSign Distribution/O=XSign/C=SA',
+    ])
+    created = apple.create_distribution_certificate(csr.read_text(encoding='utf-8'))
+    cert_content = str(created.get('certificateContent', ''))
+    if not cert_content:
+        raise WorkerError('Apple Distribution certificate creation returned no certificate content.')
+    write_b64_file(cert_content, cert_der, 'Apple certificate content')
+    run(['openssl', 'x509', '-inform', 'DER', '-in', str(cert_der), '-out', str(cert_pem)])
+    run([
+        'openssl', 'pkcs12', '-export', '-inkey', str(private_key), '-in', str(cert_pem),
+        '-out', str(p12), '-passout', f'pass:{password}', '-name', 'XSign Apple Distribution',
+    ])
+    p12_b64 = base64.b64encode(p12.read_bytes()).decode('ascii')
+    xs.save_signing_identity(p12_b64, password)
+    print('Persisted new XSign signing identity in encrypted AppDeploy storage.')
+    return password
 
 
 def import_p12(p12: Path, password: str, work: Path) -> tuple[Path, str, str]:
@@ -363,7 +364,7 @@ def import_p12(p12: Path, password: str, work: Path) -> tuple[Path, str, str]:
     identities = run(['security', 'find-identity', '-v', '-p', 'codesigning', str(keychain)])
     match = re.search(r'\b([0-9A-F]{40})\b', identities)
     if not match:
-        raise WorkerError('No code-signing identity was found in APPLE_DISTRIBUTION_P12_B64.')
+        raise WorkerError('No Apple code-signing identity was found in the persisted PKCS#12 identity.')
     identity = match.group(1)
 
     cert_pem = work / 'distribution-cert.pem'
@@ -393,13 +394,11 @@ def profile_entitlements(profile: Path, output: Path) -> tuple[Path, str | None]
 def sign_code_objects(bundle: Path, identity: str, keychain: Path) -> None:
     targets: list[Path] = []
     for framework_dir in bundle.rglob('*.framework'):
-        if any(part.endswith('.appex') for part in framework_dir.parts):
-            continue
-        targets.append(framework_dir)
+        if not any(part.endswith('.appex') for part in framework_dir.parts):
+            targets.append(framework_dir)
     for dylib in bundle.rglob('*.dylib'):
-        if any(part.endswith('.appex') for part in dylib.parts):
-            continue
-        targets.append(dylib)
+        if not any(part.endswith('.appex') for part in dylib.parts):
+            targets.append(dylib)
     for target in sorted(set(targets), key=lambda p: len(p.parts), reverse=True):
         run([
             'codesign', '--force', '--sign', identity, '--keychain', str(keychain), '--timestamp=none',
@@ -452,13 +451,25 @@ def upload_output(client: XSignClient, job_id: str, ipa: Path) -> int:
     return count
 
 
-def prepare_profiles(apple: AppleClient, specs: list[BundleSpec], device_resource: str, cert_resource: str, work: Path, job_id: str, udid: str) -> None:
+def prepare_profiles(
+    apple: AppleClient,
+    specs: list[BundleSpec],
+    device_resource: str,
+    cert_resource: str,
+    work: Path,
+    udid: str,
+) -> None:
     for index, spec in enumerate(specs):
         spec.bundle_resource_id = apple.get_or_create_bundle_id(spec.new_id, spec.display_name)
         if spec.needs_push:
             apple.ensure_capability(spec.bundle_resource_id, 'PUSH_NOTIFICATIONS')
         profile_name = f"XSign-{hashlib.sha1(spec.new_id.encode()).hexdigest()[:10]}-{udid[-8:]}-{cert_resource[-6:]}"
-        profile_bytes, expiration = apple.get_or_create_profile(profile_name, spec.bundle_resource_id, device_resource, cert_resource)
+        profile_bytes, expiration = apple.get_or_create_profile(
+            profile_name,
+            spec.bundle_resource_id,
+            device_resource,
+            cert_resource,
+        )
         profile_path = work / f'profile-{index}.mobileprovision'
         profile_path.write_bytes(profile_bytes)
         spec.profile_path = profile_path
@@ -481,8 +492,7 @@ def process_job(xs: XSignClient, apple: AppleClient, job: dict[str, Any]) -> Non
         for spec in specs:
             print(f'  {spec.original_id} -> {spec.new_id}')
 
-        decode_secret_file('APPLE_DISTRIBUTION_P12_B64', p12)
-        p12_password = required_env('APPLE_DISTRIBUTION_P12_PASSWORD')
+        p12_password = bootstrap_signing_identity(xs, apple, p12, work)
         keychain, identity, serial = import_p12(p12, p12_password, work)
         cert_id = apple.certificate_id_for_serial(serial)
 
@@ -490,7 +500,7 @@ def process_job(xs: XSignClient, apple: AppleClient, job: dict[str, Any]) -> Non
         device_id = apple.get_or_register_device(str(job['udid']), str(job.get('deviceName') or 'XSign iPhone'))
 
         xs.status(job_id, 'creating_profile', 'إنشاء App IDs وملفات Provisioning للتطبيق والإضافات')
-        prepare_profiles(apple, specs, device_id, cert_id, work, job_id, str(job['udid']))
+        prepare_profiles(apple, specs, device_id, cert_id, work, str(job['udid']))
 
         xs.status(job_id, 'signing', 'توقيع الإضافات ثم التطبيق الرئيسي')
         for index, spec in enumerate([s for s in specs if s.is_extension]):
@@ -552,8 +562,10 @@ def main() -> int:
         return inspect_only(args.inspect_ipa, args.bundle_prefix)
 
     xs = XSignClient()
-    apple = AppleClient()
+    apple = AppleClient(xs)
     xs.heartbeat()
+    xs.apple('ping')
+    print('Apple API credentials verified.')
     processed = 0
     while processed < max(1, min(args.max_jobs, 10)):
         job = xs.claim()
