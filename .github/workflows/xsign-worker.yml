@@ -1,0 +1,42 @@
+name: XSign macOS Signing Worker
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+
+concurrency:
+  group: xsign-signing-worker
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  sign:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      XSIGN_BASE_URL: https://xsign-0xcfp9.v2.appdeploy.ai
+      APPLE_ISSUER_ID: ${{ secrets.APPLE_ISSUER_ID }}
+      APPLE_KEY_ID: ${{ secrets.APPLE_KEY_ID }}
+      APPLE_PRIVATE_KEY_P8_B64: ${{ secrets.APPLE_PRIVATE_KEY_P8_B64 }}
+      APPLE_DISTRIBUTION_P12_B64: ${{ secrets.APPLE_DISTRIBUTION_P12_B64 }}
+      APPLE_DISTRIBUTION_P12_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_P12_PASSWORD }}
+      APPLE_BUNDLE_PREFIX: ${{ vars.APPLE_BUNDLE_PREFIX }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install worker dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-xsign.txt
+
+      - name: Run XSign worker
+        run: python xsign_worker.py --max-jobs 5
