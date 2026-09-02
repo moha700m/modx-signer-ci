@@ -23,7 +23,7 @@ import requests
 
 CHUNK_SIZE = 384 * 1024
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
-WORKER_VERSION = '3.0.0'
+WORKER_VERSION = '3.1.0'
 
 
 class WorkerError(RuntimeError):
@@ -129,6 +129,12 @@ class XSignClient:
         if expiration:
             payload['expirationDate'] = expiration
         self.request('POST', f'/api/worker/jobs/{job_id}/complete', json_body=payload)
+
+    def portal_complete(self, job_id: str, filename: str, expiration: str | None) -> None:
+        payload: dict[str, Any] = {'filename': filename}
+        if expiration:
+            payload['expirationDate'] = expiration
+        self.request('POST', f'/api/worker/jobs/{job_id}/portal-complete', json_body=payload)
 
     def fail(self, job_id: str, message: str) -> None:
         try:
@@ -431,10 +437,142 @@ def repack(unpacked: Path, output: Path) -> None:
             raise WorkerError(f'Signed IPA ZIP integrity check failed at {bad}.')
 
 
+PORTAL_HOST = 'xmod-store-mohammed.moha702m.chatgpt.site'
+MAX_PORTAL_IPA_SIZE = 200 * 1024 * 1024
+
+
+def validated_portal_url(value: str, kind: str) -> str:
+    parsed = urllib.parse.urlparse(value)
+    pattern = rf'^/api/signing/{kind}/[0-9a-f-]{{36}}$'
+    if (
+        parsed.scheme != 'https'
+        or parsed.netloc != PORTAL_HOST
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or not re.fullmatch(pattern, parsed.path, re.IGNORECASE)
+    ):
+        raise WorkerError(f'Invalid portal {kind} URL.')
+    return urllib.parse.urlunparse(parsed)
+
+
+def portal_token(job: dict[str, Any]) -> str:
+    token = str(job.get('signingToken') or '').strip()
+    if not re.fullmatch(r'[0-9a-f]{64}', token, re.IGNORECASE):
+        raise WorkerError('Portal signing token is invalid.')
+    return token
+
+
 def download_input(client: XSignClient, job: dict[str, Any], output: Path) -> None:
+    source_url = str(job.get('sourceUrl') or '').strip()
+    if source_url:
+        url = validated_portal_url(source_url, 'source')
+        expected_size = int(job.get('size') or 0)
+        if expected_size < 1 or expected_size > MAX_PORTAL_IPA_SIZE:
+            raise WorkerError('Portal IPA size is outside the allowed range.')
+        with requests.get(
+            url,
+            headers={
+                'X-Signing-Token': portal_token(job),
+                'User-Agent': f'XSign-GitHub-Worker/{WORKER_VERSION}',
+            },
+            stream=True,
+            timeout=(30, 900),
+            allow_redirects=False,
+        ) as response:
+            if response.status_code != 200:
+                raise WorkerError(f'Portal IPA download failed ({response.status_code}).')
+            declared = int(response.headers.get('Content-Length') or 0)
+            if declared and declared != expected_size:
+                raise WorkerError('Portal IPA Content-Length does not match the job.')
+            total = 0
+            with output.open('wb') as f:
+                for chunk in response.iter_content(1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > expected_size or total > MAX_PORTAL_IPA_SIZE:
+                        raise WorkerError('Portal IPA exceeded the declared size.')
+                    f.write(chunk)
+            if total != expected_size:
+                raise WorkerError('Portal IPA download was incomplete.')
+        return
+
     with output.open('wb') as f:
         for index in range(int(job['chunkCount'])):
             f.write(client.input_chunk(job['id'], index))
+
+
+def upload_portal_output(
+    job: dict[str, Any],
+    ipa: Path,
+    app: Path,
+    main_spec: BundleSpec,
+    filename: str,
+) -> None:
+    callback_url = validated_portal_url(str(job.get('callbackUrl') or '').strip(), 'callback')
+    _, info = read_info(app)
+    size = ipa.stat().st_size
+    if size < 1 or size > MAX_PORTAL_IPA_SIZE:
+        raise WorkerError('Signed portal IPA size is outside the allowed range.')
+    digest = hashlib.sha256()
+    with ipa.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    expiration = str(main_spec.expiration or '').strip()
+    if not expiration:
+        raise WorkerError('Provisioning profile expiration is missing.')
+    display_name = str(info.get('CFBundleDisplayName') or info.get('CFBundleName') or 'XMOD').strip()
+    if not display_name.isascii():
+        display_name = 'XMOD'
+    headers = {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': str(size),
+        'X-Signing-Token': portal_token(job),
+        'X-XSign-Job-ID': str(job['id']),
+        'X-XSign-Bundle-ID': main_spec.new_id,
+        'X-XSign-Version': str(info.get('CFBundleShortVersionString') or '1.0')[:40],
+        'X-XSign-Build': str(info.get('CFBundleVersion') or '1')[:40],
+        'X-XSign-Display-Name': display_name[:80],
+        'X-XSign-Min-IOS': str(info.get('MinimumOSVersion') or '15.0')[:20],
+        'X-XSign-Profile-Expires': expiration[:60],
+        'X-File-SHA256': digest.hexdigest(),
+        'X-File-Name': urllib.parse.quote(filename, safe='._-'),
+        'X-File-Size': str(size),
+        'User-Agent': f'XSign-GitHub-Worker/{WORKER_VERSION}',
+    }
+    with ipa.open('rb') as stream:
+        response = requests.put(
+            callback_url,
+            headers=headers,
+            data=stream,
+            timeout=(30, 900),
+            allow_redirects=False,
+        )
+    if response.status_code < 200 or response.status_code >= 300:
+        raise WorkerError(f'Portal signed IPA upload failed ({response.status_code}): {response.text[:500]}')
+
+
+def report_portal_failure(job: dict[str, Any], message: str) -> None:
+    callback_url = str(job.get('callbackUrl') or '').strip()
+    if not callback_url:
+        return
+    try:
+        failed_url = validated_portal_url(callback_url, 'callback') + '/failed'
+        response = requests.post(
+            failed_url,
+            headers={
+                'X-Signing-Token': portal_token(job),
+                'User-Agent': f'XSign-GitHub-Worker/{WORKER_VERSION}',
+            },
+            json={'jobId': str(job['id']), 'error': message[:500]},
+            timeout=(30, 120),
+            allow_redirects=False,
+        )
+        if response.status_code < 200 or response.status_code >= 300:
+            print(f'Could not report failure to portal: HTTP {response.status_code}')
+    except Exception as exc:
+        print(f'Could not report failure to portal: {exc}')
 
 
 def upload_output(client: XSignClient, job_id: str, ipa: Path) -> int:
@@ -523,10 +661,15 @@ def process_job(xs: XSignClient, apple: AppleClient, job: dict[str, Any]) -> Non
         run(['codesign', '--verify', '--deep', '--strict', '--verbose=2', str(app)])
         repack(work / 'unpacked', output_ipa)
 
-        xs.status(job_id, 'uploading_result', 'رفع النسخة الموقعة إلى XSign')
-        chunk_count = upload_output(xs, job_id, output_ipa)
         filename = re.sub(r'(?i)\.ipa$', '', str(job['filename'])) + '-signed.ipa'
-        xs.complete(job_id, chunk_count, filename, main_spec.expiration)
+        if job.get('callbackUrl'):
+            xs.status(job_id, 'uploading_result', 'رفع النسخة الموقعة إلى بوابة العميل')
+            upload_portal_output(job, output_ipa, app, main_spec, filename)
+            xs.portal_complete(job_id, filename, main_spec.expiration)
+        else:
+            xs.status(job_id, 'uploading_result', 'رفع النسخة الموقعة إلى XSign')
+            chunk_count = upload_output(xs, job_id, output_ipa)
+            xs.complete(job_id, chunk_count, filename, main_spec.expiration)
         print(f'[{job_id}] ready: {filename}')
 
 
@@ -577,6 +720,7 @@ def main() -> int:
         except Exception as exc:
             message = str(exc) or exc.__class__.__name__
             print(f"[{job['id']}] FAILED: {message}")
+            report_portal_failure(job, message)
             xs.fail(str(job['id']), message)
         processed += 1
         xs.heartbeat()
