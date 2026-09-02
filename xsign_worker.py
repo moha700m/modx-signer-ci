@@ -23,7 +23,7 @@ import requests
 
 CHUNK_SIZE = 384 * 1024
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
-WORKER_VERSION = '3.2.11'
+WORKER_VERSION = '3.2.12'
 
 
 class WorkerError(RuntimeError):
@@ -470,14 +470,18 @@ def profile_entitlements(profile: Path, output: Path) -> tuple[Path, str | None]
 def remove_existing_signature(target: Path) -> None:
     # Existing signatures can contain requirements/entitlements from the original
     # developer team. Remove them before applying the new profile and identity.
-    subprocess.run(
-        ['codesign', '--remove-signature', str(target)],
+    resolved = target.resolve()
+    removed = subprocess.run(
+        ['codesign', '--remove-signature', str(resolved)],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
-    signature = target / '_CodeSignature'
+    detail = (removed.stderr or removed.stdout or '').strip()
+    if removed.returncode != 0 and detail and 'not signed' not in detail.lower():
+        print(f'Existing signature cleanup warning for {target.name}: {detail[:300]}')
+    signature = resolved / '_CodeSignature'
     if signature.exists():
         shutil.rmtree(signature)
 
@@ -500,11 +504,12 @@ def framework_executable(framework: Path) -> Path | None:
         ])
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():
-            return candidate
+            return candidate.resolve()
     return None
 
 
 def sign_target(target: Path, identity: str, keychain: Path) -> None:
+    target = target.resolve()
     remove_existing_signature(target)
     run([
         'codesign', '--force', '--sign', identity, '--keychain', str(keychain), '--timestamp=none',
