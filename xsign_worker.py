@@ -23,7 +23,7 @@ import requests
 
 CHUNK_SIZE = 384 * 1024
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
-WORKER_VERSION = '3.2.7'
+WORKER_VERSION = '3.2.8'
 
 
 class WorkerError(RuntimeError):
@@ -467,6 +467,21 @@ def profile_entitlements(profile: Path, output: Path) -> tuple[Path, str | None]
     return entitlements_path, expiration_iso
 
 
+def remove_existing_signature(target: Path) -> None:
+    # Existing signatures can contain requirements/entitlements from the original
+    # developer team. Remove them before applying the new profile and identity.
+    subprocess.run(
+        ['codesign', '--remove-signature', str(target)],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    signature = target / '_CodeSignature'
+    if signature.exists():
+        shutil.rmtree(signature)
+
+
 def sign_code_objects(bundle: Path, identity: str, keychain: Path) -> None:
     targets: list[Path] = []
     for framework_dir in bundle.rglob('*.framework'):
@@ -476,17 +491,16 @@ def sign_code_objects(bundle: Path, identity: str, keychain: Path) -> None:
         if not any(part.endswith('.appex') for part in dylib.parts):
             targets.append(dylib)
     for target in sorted(set(targets), key=lambda p: len(p.parts), reverse=True):
+        remove_existing_signature(target)
         run([
             'codesign', '--force', '--sign', identity, '--keychain', str(keychain), '--timestamp=none',
-            '--preserve-metadata=identifier,requirements,flags,runtime', str(target),
+            str(target),
         ])
 
 
 def sign_bundle(spec: BundleSpec, identity: str, keychain: Path, entitlements: Path) -> None:
     sign_code_objects(spec.path, identity, keychain)
-    signature = spec.path / '_CodeSignature'
-    if signature.exists():
-        shutil.rmtree(signature)
+    remove_existing_signature(spec.path)
     run([
         'codesign', '--force', '--sign', identity, '--keychain', str(keychain), '--timestamp=none',
         '--entitlements', str(entitlements), str(spec.path),
