@@ -24,7 +24,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 30
     env:
-      XSIGN_BASE_URL: https://xsign-0xcfp9.v2.appdeploy.ai
+      XSIGN_BASE_URL: https://api-v2.appdeploy.ai/app/xsign-0xcfp9
       APPLE_BUNDLE_PREFIX: com.moha700m.xsign
 
     steps:
