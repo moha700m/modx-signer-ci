@@ -23,7 +23,7 @@ import requests
 
 CHUNK_SIZE = 384 * 1024
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
-WORKER_VERSION = '3.2.5'
+WORKER_VERSION = '3.2.6'
 
 
 class WorkerError(RuntimeError):
@@ -671,7 +671,7 @@ def prepare_profiles(
         spec.bundle_resource_id = apple.get_or_create_bundle_id(spec.new_id, spec.display_name)
         if spec.needs_push:
             apple.ensure_capability(spec.bundle_resource_id, 'PUSH_NOTIFICATIONS')
-        profile_name = f"XSign-{hashlib.sha1(spec.new_id.encode()).hexdigest()[:10]}-{udid[-8:]}-{cert_resource[-6:]}"
+        profile_name = f"XSign-{hashlib.sha1(spec.new_id.encode()).hexdigest()[:10]}-{udid[-8:]}-{cert_resource[-6:]}-{pysecrets.token_hex(4).upper()}"
         profile_bytes, expiration = apple.get_or_create_profile(
             profile_name,
             spec.bundle_resource_id,
