@@ -73,7 +73,7 @@ def github_oidc_token() -> str:
 
 class XSignClient:
     def __init__(self) -> None:
-        self.base = os.environ.get('XSIGN_BASE_URL', 'https://xsign-0xcfp9.v2.appdeploy.ai').rstrip('/')
+        self.base = os.environ.get('XSIGN_BASE_URL', 'https://api-v2.appdeploy.ai/app/xsign-0xcfp9').rstrip('/')
         self.s = requests.Session()
         self.s.headers.update({
             'Authorization': f'Bearer {github_oidc_token()}',
