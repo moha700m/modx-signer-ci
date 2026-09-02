@@ -23,7 +23,7 @@ import requests
 
 CHUNK_SIZE = 384 * 1024
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
-WORKER_VERSION = '3.1.0'
+WORKER_VERSION = '3.2.0'
 
 
 class WorkerError(RuntimeError):
@@ -325,18 +325,13 @@ def write_b64_file(value: str, output: Path, label: str) -> None:
         raise WorkerError(f'{label} is not valid base64.') from exc
 
 
-def bootstrap_signing_identity(xs: XSignClient, apple: AppleClient, p12: Path, work: Path) -> str:
-    existing = xs.get_signing_identity()
-    if existing:
-        write_b64_file(existing['p12B64'], p12, 'Stored signing identity')
-        return existing['password']
-
-    print('No persisted signing identity found; creating one through Apple API.')
+def create_signing_identity(xs: XSignClient, apple: AppleClient, p12: Path, work: Path) -> str:
+    print('Creating a macOS-compatible XSign signing identity through Apple API.')
     private_key = work / 'distribution-private.pem'
     csr = work / 'distribution.csr'
     cert_der = work / 'distribution.cer'
     cert_pem = work / 'distribution.pem'
-    password = pysecrets.token_urlsafe(36)
+    password = pysecrets.token_hex(36)
 
     run(['openssl', 'genrsa', '-out', str(private_key), '2048'])
     run([
@@ -350,13 +345,66 @@ def bootstrap_signing_identity(xs: XSignClient, apple: AppleClient, p12: Path, w
     write_b64_file(cert_content, cert_der, 'Apple certificate content')
     run(['openssl', 'x509', '-inform', 'DER', '-in', str(cert_der), '-out', str(cert_pem)])
     run([
-        'openssl', 'pkcs12', '-export', '-inkey', str(private_key), '-in', str(cert_pem),
-        '-out', str(p12), '-passout', f'pass:{password}', '-name', 'XSign Apple Distribution',
+        'openssl', 'pkcs12', '-legacy', '-export',
+        '-inkey', str(private_key), '-in', str(cert_pem),
+        '-out', str(p12), '-passout', f'pass:{password}',
+        '-name', 'XSign Apple Distribution',
+        '-macalg', 'sha1',
+        '-keypbe', 'PBE-SHA1-3DES',
+        '-certpbe', 'PBE-SHA1-3DES',
     ])
     p12_b64 = base64.b64encode(p12.read_bytes()).decode('ascii')
     xs.save_signing_identity(p12_b64, password)
     print('Persisted new XSign signing identity in encrypted AppDeploy storage.')
     return password
+
+
+def bootstrap_signing_identity(
+    xs: XSignClient,
+    apple: AppleClient,
+    p12: Path,
+    work: Path,
+) -> tuple[str, bool]:
+    existing = xs.get_signing_identity()
+    if existing:
+        write_b64_file(existing['p12B64'], p12, 'Stored signing identity')
+        return existing['password'], True
+    return create_signing_identity(xs, apple, p12, work), False
+
+
+def rewrap_signing_identity(xs: XSignClient, p12: Path, password: str, work: Path) -> str:
+    raw_key = work / 'persisted-private.raw.pem'
+    raw_cert = work / 'persisted-cert.raw.pem'
+    clean_key = work / 'persisted-private.pem'
+    clean_cert = work / 'persisted-cert.pem'
+    compatible_p12 = work / 'distribution-compatible.p12'
+
+    run([
+        'openssl', 'pkcs12', '-in', str(p12), '-nocerts', '-nodes',
+        '-passin', f'pass:{password}', '-out', str(raw_key),
+    ])
+    run([
+        'openssl', 'pkcs12', '-in', str(p12), '-clcerts', '-nokeys',
+        '-passin', f'pass:{password}', '-out', str(raw_cert),
+    ])
+    run(['openssl', 'pkey', '-in', str(raw_key), '-out', str(clean_key)])
+    run(['openssl', 'x509', '-in', str(raw_cert), '-out', str(clean_cert)])
+
+    new_password = pysecrets.token_hex(36)
+    run([
+        'openssl', 'pkcs12', '-legacy', '-export',
+        '-inkey', str(clean_key), '-in', str(clean_cert),
+        '-out', str(compatible_p12), '-passout', f'pass:{new_password}',
+        '-name', 'XSign Apple Distribution',
+        '-macalg', 'sha1',
+        '-keypbe', 'PBE-SHA1-3DES',
+        '-certpbe', 'PBE-SHA1-3DES',
+    ])
+    shutil.copy2(compatible_p12, p12)
+    p12_b64 = base64.b64encode(p12.read_bytes()).decode('ascii')
+    xs.save_signing_identity(p12_b64, new_password)
+    print('Rewrapped the persisted signing identity for macOS keychain compatibility.')
+    return new_password
 
 
 def import_p12(p12: Path, password: str, work: Path) -> tuple[Path, str, str]:
@@ -630,8 +678,15 @@ def process_job(xs: XSignClient, apple: AppleClient, job: dict[str, Any]) -> Non
         for spec in specs:
             print(f'  {spec.original_id} -> {spec.new_id}')
 
-        p12_password = bootstrap_signing_identity(xs, apple, p12, work)
-        keychain, identity, serial = import_p12(p12, p12_password, work)
+        p12_password, reused_identity = bootstrap_signing_identity(xs, apple, p12, work)
+        try:
+            keychain, identity, serial = import_p12(p12, p12_password, work)
+        except WorkerError as exc:
+            if not reused_identity:
+                raise
+            print(f'Persisted signing identity is not macOS-compatible ({exc}); rewrapping it.')
+            p12_password = rewrap_signing_identity(xs, p12, p12_password, work)
+            keychain, identity, serial = import_p12(p12, p12_password, work)
         cert_id = apple.certificate_id_for_serial(serial)
 
         xs.status(job_id, 'registering_device', 'تسجيل جهاز iPhone لدى Apple Developer')
