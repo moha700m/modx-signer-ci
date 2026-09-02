@@ -23,7 +23,7 @@ import requests
 
 CHUNK_SIZE = 384 * 1024
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
-WORKER_VERSION = '3.2.10'
+WORKER_VERSION = '3.2.11'
 
 
 class WorkerError(RuntimeError):
