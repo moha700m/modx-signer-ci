@@ -23,7 +23,7 @@ import requests
 
 CHUNK_SIZE = 384 * 1024
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
-WORKER_VERSION = '3.2.9'
+WORKER_VERSION = '3.2.10'
 
 
 class WorkerError(RuntimeError):
@@ -482,6 +482,36 @@ def remove_existing_signature(target: Path) -> None:
         shutil.rmtree(signature)
 
 
+def framework_executable(framework: Path) -> Path | None:
+    info_path = framework / 'Info.plist'
+    executable_name = ''
+    if info_path.exists():
+        try:
+            _, info = read_info(framework)
+            executable_name = str(info.get('CFBundleExecutable') or '').strip()
+        except Exception:
+            executable_name = ''
+    candidates: list[Path] = []
+    if executable_name:
+        candidates.extend([
+            framework / executable_name,
+            framework / 'Versions' / 'Current' / executable_name,
+            framework / 'Versions' / 'A' / executable_name,
+        ])
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def sign_target(target: Path, identity: str, keychain: Path) -> None:
+    remove_existing_signature(target)
+    run([
+        'codesign', '--force', '--sign', identity, '--keychain', str(keychain), '--timestamp=none',
+        str(target),
+    ])
+
+
 def sign_code_objects(bundle: Path, identity: str, keychain: Path) -> None:
     targets: list[Path] = []
     for framework_dir in bundle.rglob('*.framework'):
@@ -491,11 +521,14 @@ def sign_code_objects(bundle: Path, identity: str, keychain: Path) -> None:
         if not any(part.endswith('.appex') for part in dylib.parts):
             targets.append(dylib)
     for target in sorted(set(targets), key=lambda p: len(p.parts), reverse=True):
-        remove_existing_signature(target)
-        run([
-            'codesign', '--force', '--sign', identity, '--keychain', str(keychain), '--timestamp=none',
-            str(target),
-        ])
+        try:
+            sign_target(target, identity, keychain)
+        except WorkerError as exc:
+            executable = framework_executable(target) if target.suffix == '.framework' else None
+            if executable is None:
+                raise
+            print(f'Framework bundle signing failed for {target.name}; signing its executable instead ({exc}).')
+            sign_target(executable, identity, keychain)
 
 
 def sign_bundle(spec: BundleSpec, identity: str, keychain: Path, entitlements: Path) -> None:
