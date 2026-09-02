@@ -37,6 +37,24 @@ def required_env(name: str) -> str:
     return value
 
 
+def command_preview(args: list[str]) -> str:
+    redacted: list[str] = []
+    hide_next = False
+    sensitive_flags = {'-p', '-P', '-k', '-passin', '-passout'}
+    for arg in args:
+        if hide_next:
+            redacted.append('***')
+            hide_next = False
+            continue
+        if '=' in arg and arg.split('=', 1)[0] in sensitive_flags:
+            redacted.append(f'{arg.split("=", 1)[0]}=***')
+            continue
+        redacted.append(arg)
+        if arg in sensitive_flags:
+            hide_next = True
+    return ' '.join(redacted[:5])
+
+
 def run(args: list[str], *, cwd: Path | None = None, capture: bool = True) -> str:
     proc = subprocess.run(
         args,
@@ -50,7 +68,7 @@ def run(args: list[str], *, cwd: Path | None = None, capture: bool = True) -> st
         stderr = (proc.stderr or '').strip()
         stdout = (proc.stdout or '').strip()
         detail = stderr or stdout or f'exit code {proc.returncode}'
-        raise WorkerError(f"{' '.join(args[:5])} failed: {detail[:1800]}")
+        raise WorkerError(f'{command_preview(args)} failed: {detail[:1800]}')
     return (proc.stdout or '').strip()
 
 
@@ -408,7 +426,7 @@ def rewrap_signing_identity(xs: XSignClient, p12: Path, password: str, work: Pat
 
 
 def import_p12(p12: Path, password: str, work: Path) -> tuple[Path, str, str]:
-    keychain = work / 'xsign.keychain-db'
+    keychain = work / f'{work.name}.keychain-db'
     keychain_password = pysecrets.token_urlsafe(32)
     run(['security', 'create-keychain', '-p', keychain_password, str(keychain)])
     run(['security', 'set-keychain-settings', '-lut', '21600', str(keychain)])
