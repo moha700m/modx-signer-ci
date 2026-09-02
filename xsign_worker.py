@@ -23,7 +23,7 @@ import requests
 
 CHUNK_SIZE = 384 * 1024
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
-WORKER_VERSION = '3.2.15'
+WORKER_VERSION = '3.2.16'
 
 
 class WorkerError(RuntimeError):
@@ -477,10 +477,43 @@ def profile_entitlements(profile: Path, output: Path) -> tuple[Path, str | None]
     return entitlements_path, expiration_iso
 
 
+def strip_macho_signature(target: Path) -> bool:
+    """Remove malformed LC_CODE_SIGNATURE commands before Apple's codesign runs."""
+    try:
+        import lief
+    except Exception:
+        return False
+    try:
+        parsed = lief.MachO.parse(str(target), config=lief.MachO.ParserConfig.deep)
+        if isinstance(parsed, lief.MachO.FatBinary):
+            binaries = [parsed.at(index) for index in range(parsed.size)]
+        else:
+            binaries = [parsed]
+        changed = False
+        for binary in binaries:
+            if binary.has_code_signature:
+                binary.remove_signature()
+                changed = True
+        if not changed:
+            return False
+        mode = target.stat().st_mode
+        temporary = target.with_name(f'.{target.name}.unsigned')
+        if temporary.exists():
+            temporary.unlink()
+        parsed.write(str(temporary))
+        temporary.chmod(mode)
+        os.replace(temporary, target)
+        return True
+    except Exception as exc:
+        print(f'Mach-O signature cleanup skipped for {target.name}: {str(exc)[:300]}')
+        return False
+
+
 def remove_existing_signature(target: Path) -> None:
     # Existing signatures can contain requirements/entitlements from the original
     # developer team. Remove them before applying the new profile and identity.
     resolved = target.resolve()
+    strip_macho_signature(resolved)
     removed = subprocess.run(
         ['codesign', '--remove-signature', str(resolved)],
         check=False,
