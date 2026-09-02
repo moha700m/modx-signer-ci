@@ -23,7 +23,7 @@ import requests
 
 CHUNK_SIZE = 384 * 1024
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
-WORKER_VERSION = '3.2.13'
+WORKER_VERSION = '3.2.14'
 
 
 class WorkerError(RuntimeError):
@@ -431,9 +431,19 @@ def import_p12(p12: Path, password: str, work: Path) -> tuple[Path, str, str]:
     run(['security', 'create-keychain', '-p', keychain_password, str(keychain)])
     run(['security', 'set-keychain-settings', '-lut', '21600', str(keychain)])
     run(['security', 'unlock-keychain', '-p', keychain_password, str(keychain)])
-    # codesign only searches keychains in the user's search list. Register this
-    # temporary keychain as both the active search and default keychain.
-    run(['security', 'list-keychains', '-d', 'user', '-s', str(keychain)])
+    # codesign needs both the temporary identity keychain and Apple's
+    # intermediate/system keychains (for example WWDR). Preserve the existing
+    # search list instead of replacing it with an isolated keychain.
+    existing = run(['security', 'list-keychains'])
+    search_keychains = [str(keychain)]
+    search_keychains.extend(re.findall(r'"([^"]+)"', existing))
+    for system_keychain in (
+        '/Library/Keychains/System.keychain',
+        '/System/Library/Keychains/SystemRootCertificates.keychain',
+    ):
+        if Path(system_keychain).exists() and system_keychain not in search_keychains:
+            search_keychains.append(system_keychain)
+    run(['security', 'list-keychains', '-d', 'user', '-s', *search_keychains])
     run(['security', 'default-keychain', '-d', 'user', '-s', str(keychain)])
     run(['security', 'import', str(p12), '-k', str(keychain), '-P', password, '-T', '/usr/bin/codesign', '-T', '/usr/bin/security'])
     run(['security', 'set-key-partition-list', '-S', 'apple-tool:,apple:,codesign:', '-s', '-k', keychain_password, str(keychain)])
