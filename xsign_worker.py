@@ -23,7 +23,7 @@ import requests
 
 CHUNK_SIZE = 384 * 1024
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
-WORKER_VERSION = '3.2.17'
+WORKER_VERSION = '3.2.18'
 
 
 class WorkerError(RuntimeError):
@@ -513,7 +513,23 @@ def remove_existing_signature(target: Path) -> None:
     # Existing signatures can contain requirements/entitlements from the original
     # developer team. Remove them before applying the new profile and identity.
     resolved = target.resolve()
-    strip_macho_signature(resolved)
+    macho_target = resolved
+    if resolved.is_dir():
+        try:
+            _, bundle_info = read_info(resolved)
+            executable_name = str(bundle_info.get('CFBundleExecutable') or '').strip()
+            if executable_name:
+                for candidate in (
+                    resolved / executable_name,
+                    resolved / 'Versions' / 'Current' / executable_name,
+                    resolved / 'Versions' / 'A' / executable_name,
+                ):
+                    if candidate.exists() and candidate.is_file():
+                        macho_target = candidate.resolve()
+                        break
+        except Exception:
+            pass
+    strip_macho_signature(macho_target)
     removed = subprocess.run(
         ['codesign', '--remove-signature', str(resolved)],
         check=False,
