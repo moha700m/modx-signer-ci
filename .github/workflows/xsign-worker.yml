@@ -39,5 +39,20 @@ jobs:
       - name: Install worker dependencies
         run: python -m pip install --disable-pip-version-check -r requirements-xsign.txt
 
-      - name: Run XSign worker
-        run: python xsign_worker.py --max-jobs 5
+      - name: Keep XSign worker warm
+        shell: bash
+        run: |
+          started=$SECONDS
+          while (( SECONDS - started < 240 )); do
+            echo "Polling XSign signing queue..."
+            python xsign_worker.py --max-jobs 10
+            remaining=$((240 - (SECONDS - started)))
+            if (( remaining <= 0 )); then
+              break
+            fi
+            sleep_for=10
+            if (( remaining < sleep_for )); then
+              sleep_for=$remaining
+            fi
+            sleep "$sleep_for"
+          done
