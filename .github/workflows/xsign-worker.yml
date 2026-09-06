@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   sign:
-    runs-on: macos-26
+    runs-on: macos-15
     timeout-minutes: 30
     env:
       XSIGN_BASE_URL: https://api-v2.appdeploy.ai/app/xsign-0xcfp9
