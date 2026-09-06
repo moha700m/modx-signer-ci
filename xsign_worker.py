@@ -12,6 +12,7 @@ import secrets as pysecrets
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 import zipfile
@@ -186,20 +187,42 @@ class AppleClient:
     def __init__(self, xs: XSignClient) -> None:
         self.xs = xs
 
+    def _retry_transient(self, action: str, **kwargs: Any) -> dict[str, Any]:
+        # Apple occasionally returns 5xx responses while creating/registering
+        # resources. These ensure operations are idempotent, so retry them with
+        # backoff instead of permanently failing the customer's signing job.
+        for attempt in range(4):
+            try:
+                return self.xs.apple(action, **kwargs)
+            except WorkerError as exc:
+                if attempt >= 3 or not re.search(r'-> (500|502|503|504)\\b', str(exc)):
+                    raise
+                delay = 5 * (2 ** attempt)
+                print(
+                    f'Apple {action} temporary error; retrying in {delay}s '
+                    f'(attempt {attempt + 2}/4).'
+                )
+                time.sleep(delay)
+        raise WorkerError(f'Apple {action} retry loop exhausted.')
+
     def create_distribution_certificate(self, csr_content: str) -> dict[str, Any]:
         return self.xs.apple('certificate.create', csrContent=csr_content)
 
     def certificate_id_for_serial(self, serial: str) -> str:
-        return str(self.xs.apple('certificate.lookup', serial=serial)['id'])
+        return str(self._retry_transient('certificate.lookup', serial=serial)['id'])
 
     def get_or_register_device(self, udid: str, name: str) -> str:
-        return str(self.xs.apple('device.ensure', udid=udid, name=name)['id'])
+        return str(self._retry_transient('device.ensure', udid=udid, name=name)['id'])
 
     def get_or_create_bundle_id(self, bundle_id: str, display_name: str) -> str:
-        return str(self.xs.apple('bundle.ensure', identifier=bundle_id, name=display_name)['id'])
+        return str(self._retry_transient('bundle.ensure', identifier=bundle_id, name=display_name)['id'])
 
     def ensure_capability(self, bundle_resource_id: str, capability_type: str) -> None:
-        self.xs.apple('capability.ensure', bundleId=bundle_resource_id, capabilityType=capability_type)
+        self._retry_transient(
+            'capability.ensure',
+            bundleId=bundle_resource_id,
+            capabilityType=capability_type,
+        )
 
     def get_or_create_profile(
         self,
@@ -208,7 +231,7 @@ class AppleClient:
         device_resource: str,
         certificate_resource: str,
     ) -> tuple[bytes, str | None]:
-        data = self.xs.apple(
+        data = self._retry_transient(
             'profile.ensure',
             name=name,
             bundleId=bundle_resource,
