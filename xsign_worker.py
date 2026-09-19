@@ -1213,10 +1213,10 @@ def write_github_summary(summary: dict[str, Any]) -> None:
     path = os.environ.get('GITHUB_STEP_SUMMARY', '').strip()
     if not path:
         return
+    rendered = github_summary_lines(summary)
     try:
-        handle = open(path, 'a', encoding='utf-8')
-        with handle:
-            for line in github_summary_lines(summary):
+        with open(path, 'a', encoding='utf-8') as handle:
+            for line in rendered:
                 handle.write(line + '\n')
     except OSError as exc:
         jlog('summary_write_failed', error=str(exc))
