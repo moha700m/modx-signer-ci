@@ -35,9 +35,9 @@ def _client(max_retry_seconds: float = 5.0) -> xw.XSignClient:
 
 
 class ConfigurationTests(unittest.TestCase):
-    def test_legacy_appdeploy_worker_url_is_normalized(self) -> None:
+    def test_appdeploy_worker_proxy_is_preserved(self) -> None:
         with mock.patch.dict(os.environ, {'XSIGN_BASE_URL': 'https://api-v2.appdeploy.ai/app/xsign-demo'}, clear=False):
-            self.assertEqual(xw.configured_xsign_base_url(), 'https://xsign-demo.v2.appdeploy.ai')
+            self.assertEqual(xw.configured_xsign_base_url(), 'https://api-v2.appdeploy.ai/app/xsign-demo')
 
     def test_current_appdeploy_url_is_preserved(self) -> None:
         with mock.patch.dict(os.environ, {'XSIGN_BASE_URL': 'https://xsign-demo.v2.appdeploy.ai'}, clear=False):
