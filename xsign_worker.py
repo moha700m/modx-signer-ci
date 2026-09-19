@@ -1117,11 +1117,12 @@ FALLBACK_REQUIRED_ENV_VARS: tuple[str, ...] = (
     'SIGNING_API_BASE',
     'SIGNING_API_TOKEN',
 )
+FALLBACK_SECRET_LABELS: frozenset[str] = frozenset(FALLBACK_REQUIRED_ENV_VARS)
 
 
 class MissingSecretsError(WorkerError):
     def __init__(self, missing: list[str]) -> None:
-        self.missing = list(missing)
+        self.missing = [name for name in missing if name in FALLBACK_SECRET_LABELS]
         super().__init__(
             'Direct Apple signing fallback is not configured; missing secrets: '
             + ', '.join(self.missing)
@@ -1130,6 +1131,12 @@ class MissingSecretsError(WorkerError):
 
 def check_fallback_secrets() -> list[str]:
     return [name for name in FALLBACK_REQUIRED_ENV_VARS if not os.environ.get(name, '').strip()]
+
+
+def missing_secret_message(name: str) -> str:
+    # Only fixed, whitelisted environment-variable names are ever reported.
+    label = name if name in FALLBACK_SECRET_LABELS else 'UNKNOWN'
+    return f'Direct Apple signing fallback unavailable; missing: {label}'
 
 
 def run_fallback_direct_signing() -> int:
@@ -1141,7 +1148,7 @@ def run_fallback_direct_signing() -> int:
             message='Fallback signing disabled; jobs stay queued for the XSign worker.',
         )
         for name in missing:
-            print(f'Direct Apple signing fallback unavailable; missing: {name}', flush=True)
+            print(missing_secret_message(name), flush=True)
         return 0
     for name in ('APPLE_PRIVATE_KEY', 'APPLE_P12_BASE64', 'APPLE_P12_PASSWORD', 'SIGNING_API_TOKEN'):
         REDACTOR.register(os.environ.get(name))
@@ -1198,11 +1205,12 @@ def write_github_summary(summary: dict[str, Any]) -> None:
     missing = summary.get('fallback_missing')
     if missing:
         for name in missing:
-            lines.append(f'- Fallback secret missing: `{name}`')
+            if name in FALLBACK_SECRET_LABELS:
+                lines.append(f'- Fallback secret missing: `{name}`')
     try:
-        summary_text = '\n'.join(lines) + '\n'
         with open(path, 'a', encoding='utf-8') as handle:
-            handle.write(summary_text)
+            handle.write('\n'.join(lines))
+            handle.write('\n')
     except OSError as exc:
         jlog('summary_write_failed', error=str(exc))
 
