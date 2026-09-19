@@ -92,9 +92,8 @@ jobs:
         if: steps.health.outputs.status != '0'
         shell: bash
         run: |
-          set +e
+          set -euo pipefail
           python3 xsign_worker.py --fallback
-          echo "Fallback pass complete; unconfigured secrets were reported above."
 
       - name: Runner outcome summary
         if: always()
