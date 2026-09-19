@@ -24,8 +24,9 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     env:
-      XSIGN_BASE_URL: https://api-v2.appdeploy.ai/app/xsign-0xcfp9
-      APPLE_BUNDLE_PREFIX: com.moha700m.xsign
+      XSIGN_BASE_URL: ${{ vars.XSIGN_BASE_URL }}
+      APPLE_BUNDLE_PREFIX: ${{ vars.APPLE_BUNDLE_PREFIX || 'com.moha700m.xsign' }}
+      XSIGN_PORTAL_HOST: ${{ vars.XSIGN_PORTAL_HOST }}
 
     steps:
       - name: Checkout
@@ -39,13 +40,42 @@ jobs:
       - name: Install worker dependencies
         run: python -m pip install --disable-pip-version-check -r requirements-xsign.txt
 
-      - name: Keep XSign worker warm
+      - name: Validate workflow configuration
         shell: bash
         run: |
+          set -euo pipefail
+          python3 -m py_compile xsign_worker.py
+          echo "Worker source compiles."
+
+      - name: XSign health check
+        id: health
+        shell: bash
+        run: |
+          set +e
+          python3 xsign_worker.py --health-check --max-retry-seconds 30
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if [ "$status" -ne 0 ]; then
+            echo "XSign health check failed; deferring to the next scheduled run."
+          fi
+          exit 0
+
+      - name: Run XSign worker
+        if: steps.health.outputs.status == '0'
+        shell: bash
+        run: |
+          set +e
           started=$SECONDS
+          exit_code=0
           while (( SECONDS - started < 240 )); do
             echo "Polling XSign signing queue..."
-            python xsign_worker.py --max-jobs 10
+            python3 xsign_worker.py --max-jobs 10
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              exit_code=$rc
+              echo "Worker exited with code $rc; stopping warm loop."
+              break
+            fi
             remaining=$((240 - (SECONDS - started)))
             if (( remaining <= 0 )); then
               break
@@ -56,3 +86,32 @@ jobs:
             fi
             sleep "$sleep_for"
           done
+          exit "$exit_code"
+
+      - name: Direct Apple signing fallback
+        if: steps.health.outputs.status != '0'
+        shell: bash
+        run: |
+          set +e
+          python3 xsign_worker.py --fallback
+          echo "Fallback pass complete; unconfigured secrets were reported above."
+
+      - name: Runner outcome summary
+        if: always()
+        shell: bash
+        env:
+          HEALTH_STATUS: ${{ steps.health.outputs.status }}
+        run: |
+          {
+            echo "### XSign pipeline status"
+            echo ""
+            echo "- Runner: \`${RUNNER_NAME:-macos-15}\` (\`${{ runner.os }}\` / \`${{ runner.arch }}\`)"
+            if [ "${HEALTH_STATUS:-1}" = "0" ]; then
+              echo "- XSign health: **healthy**"
+            else
+              echo "- XSign health: **unavailable (deferred)**"
+            fi
+            echo "- Schedule: every 5 minutes (cron \`*/5 * * * *\`)"
+            echo "- Manual dispatch: enabled (workflow_dispatch)"
+            echo "- Concurrency: single active run per \`xsign-signing-worker\` group"
+          } >> "$GITHUB_STEP_SUMMARY"

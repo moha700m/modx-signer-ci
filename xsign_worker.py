@@ -7,10 +7,12 @@ import hashlib
 import json
 import os
 import plistlib
+import random
 import re
 import secrets as pysecrets
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.parse
@@ -24,11 +26,96 @@ import requests
 
 CHUNK_SIZE = 384 * 1024
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
-WORKER_VERSION = '3.2.19'
+WORKER_VERSION = '3.3.0'
+DEFAULT_XSIGN_BASE_URL = 'https://api-v2.appdeploy.ai/app/xsign-0xcfp9'
+JOB_LOG_LIMIT = 8
+
+# Transient XSign infrastructure statuses. A 402 carrying the code
+# APP_TEMPORARILY_UNAVAILABLE means the signing engine is temporarily down; it
+# is NOT a payment rejection of the customer job. Retry with backoff instead of
+# hot-looping or marking customer orders as failed.
+RETRYABLE_STATUSES = frozenset({402, 408, 429, 500, 502, 503, 504})
+RETRY_BASE_DELAY_SECONDS = 2.0
+RETRY_MAX_DELAY_SECONDS = 60.0
+RETRY_MAX_DURATION_SECONDS = 180.0
+HEALTH_RETRY_MAX_DURATION_SECONDS = 30.0
 
 
 class WorkerError(RuntimeError):
     pass
+
+
+class RetryableAPIError(WorkerError):
+    """A transient XSign API failure that is safe to retry with backoff."""
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class DeferJobs(WorkerError):
+    """XSign is unavailable right now; leave every queued job pending."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+REDACTED = '***'
+
+
+class _SecretRedactor:
+    """Best-effort scrubber so secrets never reach CI logs or status messages."""
+
+    def __init__(self) -> None:
+        self._values: list[str] = []
+
+    def register(self, value: Any) -> None:
+        text = str(value or '').strip()
+        if len(text) >= 4 and text not in self._values:
+            self._values.append(text)
+
+    def scrub(self, value: Any) -> str:
+        text = str(value)
+        for secret in self._values:
+            if secret and secret in text:
+                text = text.replace(secret, REDACTED)
+        text = re.sub(
+            r'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}',
+            REDACTED,
+            text,
+        )
+        text = re.sub(
+            r'(ACTIONS_ID_TOKEN_REQUEST_TOKEN=)\S+',
+            rf'\1{REDACTED}',
+            text,
+        )
+        text = re.sub(r'\b[0-9A-Fa-f]{40}\b', REDACTED, text)
+        text = re.sub(r'\b[0-9a-fA-F]{64}\b', REDACTED, text)
+        text = re.sub(
+            r'\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b',
+            REDACTED,
+            text,
+        )
+        return text
+
+    def scrub_structure(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: self.scrub_structure(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self.scrub_structure(item) for item in value]
+        if isinstance(value, str):
+            return self.scrub(value)
+        return value
+
+
+REDACTOR = _SecretRedactor()
+
+
+def jlog(event: str, **fields: Any) -> None:
+    """Emit one structured, sanitized log line."""
+    record: dict[str, Any] = {'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'event': event}
+    record.update(fields)
+    print(json.dumps(REDACTOR.scrub_structure(record), ensure_ascii=False, default=str), flush=True)
 
 
 def required_env(name: str) -> str:
@@ -36,6 +123,22 @@ def required_env(name: str) -> str:
     if not value:
         raise WorkerError(f'Missing required environment value: {name}')
     return value
+
+
+def configured_xsign_base_url() -> str:
+    base = os.environ.get('XSIGN_BASE_URL', '').strip()
+    if not base:
+        jlog(
+            'config_default_base_url',
+            message='XSIGN_BASE_URL is not configured; using the built-in default endpoint.',
+        )
+        return DEFAULT_XSIGN_BASE_URL
+    return base.rstrip('/')
+
+
+def sleep_with_jitter(delay: float) -> None:
+    jitter = min(delay * 0.25, 5.0)
+    time.sleep(delay + random.uniform(0.0, jitter))
 
 
 def command_preview(args: list[str]) -> str:
@@ -87,15 +190,26 @@ def github_oidc_token() -> str:
     token = str(payload.get('value', '')).strip()
     if not token:
         raise WorkerError('GitHub Actions did not return an OIDC token.')
+    REDACTOR.register(token)
     return token
 
 
+def _log_response_excerpt(response: requests.Response) -> str:
+    text = (response.text or '').strip()
+    if len(text) > 200:
+        text = text[:200] + '...'
+    return text
+
+
 class XSignClient:
-    def __init__(self) -> None:
-        self.base = os.environ.get('XSIGN_BASE_URL', 'https://api-v2.appdeploy.ai/app/xsign-0xcfp9').rstrip('/')
+    def __init__(self, max_retry_seconds: float = RETRY_MAX_DURATION_SECONDS) -> None:
+        self.base = configured_xsign_base_url()
+        self.max_retry_seconds = max(1.0, float(max_retry_seconds))
+        self.request_count = 0
         self.s = requests.Session()
         self.s.headers.update({
-            'Authorization': f'Bearer {github_oidc_token()}',
+            'Authorization': f'******',
+            'Accept': 'application/json',
             'User-Agent': f'XSign-GitHub-Worker/{WORKER_VERSION}',
         })
 
@@ -103,7 +217,7 @@ class XSignClient:
         try:
             data = response.json()
         except Exception:
-            data = {'error': response.text[:1000]}
+            data = {'error': response.text[:500]}
         if not isinstance(data, dict):
             return {'data': data}
         return data
@@ -116,18 +230,92 @@ class XSignClient:
         json_body: dict[str, Any] | None = None,
         allow_statuses: tuple[int, ...] = (),
     ) -> tuple[int, dict[str, Any]]:
-        r = self.s.request(method, f'{self.base}{path}', json=json_body, timeout=120)
-        data = self._decode(r)
-        if not r.ok and r.status_code not in allow_statuses:
-            raise WorkerError(f'XSign {method} {path} -> {r.status_code}: {data}')
-        return r.status_code, data
+        attempt = 0
+        started = time.monotonic()
+        method = method.upper()
+        last_response: requests.Response | None = None
+        while True:
+            attempt += 1
+            status_code: int | None = None
+            data: dict[str, Any] = {}
+            retry_reason: str | None = None
+            last_response = None
+            try:
+                last_response = self.s.request(method, f'{self.base}{path}', json=json_body, timeout=120)
+                status_code = last_response.status_code
+                data = self._decode(last_response)
+                if status_code in RETRYABLE_STATUSES and status_code not in allow_statuses:
+                    retry_reason = f'http_{status_code}'
+            except requests.RequestException as exc:
+                retry_reason = f'network_{exc.__class__.__name__.lower()}'
+                jlog(
+                    'http_attempt',
+                    attempt=attempt,
+                    method=method,
+                    path=path,
+                    error=exc.__class__.__name__,
+                )
+            self.request_count += 1
+            if retry_reason is None:
+                jlog(
+                    'http_request',
+                    attempt=attempt,
+                    method=method,
+                    path=path,
+                    status=status_code,
+                )
+                if status_code is not None and status_code >= 400 and status_code not in allow_statuses:
+                    raise WorkerError(f'XSign {method} {path} -> {status_code}: {REDACTOR.scrub(data)}')
+                return (status_code if status_code is not None else 0), data
+            elapsed = time.monotonic() - started
+            if elapsed >= self.max_retry_seconds:
+                jlog(
+                    'http_retry_exhausted',
+                    attempts=attempt,
+                    elapsed_seconds=round(elapsed, 1),
+                    method=method,
+                    path=path,
+                    reason=retry_reason,
+                    status=status_code,
+                )
+                if retry_reason.startswith('network_'):
+                    raise RetryableAPIError(
+                        f'XSign {method} {path} unreachable after {attempt} attempts '
+                        f'({retry_reason}) over {elapsed:.0f}s'
+                    ) from None
+                raise RetryableAPIError(
+                    f'XSign {method} {path} -> {status_code} persisted for {elapsed:.0f}s '
+                    f'across {attempt} attempts: {REDACTOR.scrub(data)}',
+                    status_code=status_code,
+                )
+            remaining = self.max_retry_seconds - elapsed
+            # Clamp the exponent before 2**n so long outages cannot overflow.
+            backoff = RETRY_BASE_DELAY_SECONDS * (2 ** min(attempt - 1, 16))
+            delay = min(backoff, RETRY_MAX_DELAY_SECONDS, remaining)
+            jlog(
+                'http_retry',
+                attempt=attempt,
+                delay_seconds=round(delay, 1),
+                method=method,
+                path=path,
+                reason=retry_reason,
+                status=status_code,
+                response_excerpt=_log_response_excerpt(last_response) if last_response is not None else '',
+            )
+            sleep_with_jitter(delay)
 
     def heartbeat(self) -> None:
         self.request('POST', '/api/worker/heartbeat', json_body={'workerId': 'github-macos', 'version': WORKER_VERSION})
 
+    def health_check(self) -> None:
+        """Readiness probe: verifies the API and Apple credentials without claiming a job."""
+        self.request('POST', '/api/worker/heartbeat', json_body={'workerId': 'github-macos-healthcheck', 'version': WORKER_VERSION})
+        self.apple('ping')
+
     def claim(self) -> dict[str, Any] | None:
         _, data = self.request('POST', '/api/worker/claim', json_body={})
-        return data.get('job')
+        job = data.get('job')
+        return job if isinstance(job, dict) else None
 
     def status(self, job_id: str, status: str, message: str) -> None:
         self.request('POST', f'/api/worker/jobs/{job_id}/status', json_body={'status': status, 'message': message})
@@ -166,8 +354,11 @@ class XSignClient:
         return data
 
     def get_signing_identity(self) -> dict[str, str] | None:
-        status, data = self.request('GET', '/api/worker/signing-identity', allow_statuses=(503, 404))
-        if status in (503, 404):
+        # 404 = no identity stored yet. Retryable statuses (e.g. 503 during an
+        # outage) deliberately retry with backoff so an identity fetch cannot
+        # silently bootstrap a duplicate certificate mid-outage.
+        status, data = self.request('GET', '/api/worker/signing-identity', allow_statuses=(404,))
+        if status == 404:
             return None
         p12_b64 = str(data.get('p12B64', ''))
         password = str(data.get('password', ''))
@@ -194,13 +385,18 @@ class AppleClient:
         for attempt in range(4):
             try:
                 return self.xs.apple(action, **kwargs)
+            except RetryableAPIError:
+                # The XSign API itself is degraded; defer instead of failing the job.
+                raise
             except WorkerError as exc:
-                if attempt >= 3 or not re.search(r'-> (500|502|503|504)\\b', str(exc)):
+                if attempt >= 3 or not re.search(r'-> (500|502|503|504)\b', str(exc)):
                     raise
                 delay = 5 * (2 ** attempt)
-                print(
-                    f'Apple {action} temporary error; retrying in {delay}s '
-                    f'(attempt {attempt + 2}/4).'
+                jlog(
+                    'apple_retry',
+                    action=action,
+                    attempt=attempt + 1,
+                    delay_seconds=delay,
                 )
                 time.sleep(delay)
         raise WorkerError(f'Apple {action} retry loop exhausted.')
@@ -367,12 +563,13 @@ def write_b64_file(value: str, output: Path, label: str) -> None:
 
 
 def create_signing_identity(xs: XSignClient, apple: AppleClient, p12: Path, work: Path) -> str:
-    print('Creating a macOS-compatible XSign signing identity through Apple API.')
+    jlog('identity_create', message='Creating a macOS-compatible XSign signing identity through Apple API.')
     private_key = work / 'distribution-private.pem'
     csr = work / 'distribution.csr'
     cert_der = work / 'distribution.cer'
     cert_pem = work / 'distribution.pem'
     password = pysecrets.token_hex(36)
+    REDACTOR.register(password)
 
     run(['openssl', 'genrsa', '-out', str(private_key), '2048'])
     run([
@@ -396,7 +593,7 @@ def create_signing_identity(xs: XSignClient, apple: AppleClient, p12: Path, work
     ])
     p12_b64 = base64.b64encode(p12.read_bytes()).decode('ascii')
     xs.save_signing_identity(p12_b64, password)
-    print('Persisted new XSign signing identity in encrypted AppDeploy storage.')
+    jlog('identity_persisted', message='Persisted new XSign signing identity in encrypted AppDeploy storage.')
     return password
 
 
@@ -408,6 +605,7 @@ def bootstrap_signing_identity(
 ) -> tuple[str, bool]:
     existing = xs.get_signing_identity()
     if existing:
+        REDACTOR.register(existing['password'])
         write_b64_file(existing['p12B64'], p12, 'Stored signing identity')
         return existing['password'], True
     return create_signing_identity(xs, apple, p12, work), False
@@ -432,6 +630,7 @@ def rewrap_signing_identity(xs: XSignClient, p12: Path, password: str, work: Pat
     run(['openssl', 'x509', '-in', str(raw_cert), '-out', str(clean_cert)])
 
     new_password = pysecrets.token_hex(36)
+    REDACTOR.register(new_password)
     run([
         'openssl', 'pkcs12', '-legacy', '-export',
         '-inkey', str(clean_key), '-in', str(clean_cert),
@@ -444,7 +643,7 @@ def rewrap_signing_identity(xs: XSignClient, p12: Path, password: str, work: Pat
     shutil.copy2(compatible_p12, p12)
     p12_b64 = base64.b64encode(p12.read_bytes()).decode('ascii')
     xs.save_signing_identity(p12_b64, new_password)
-    print('Rewrapped the persisted signing identity for macOS keychain compatibility.')
+    jlog('identity_rewrapped', message='Rewrapped the persisted signing identity for macOS keychain compatibility.')
     return new_password
 
 
@@ -641,7 +840,8 @@ def repack(unpacked: Path, output: Path) -> None:
             raise WorkerError(f'Signed IPA ZIP integrity check failed at {bad}.')
 
 
-PORTAL_HOST = 'xmod-store-mohammed.moha702m.chatgpt.site'
+DEFAULT_PORTAL_HOST = 'xmod-store-mohammed.moha702m.chatgpt.site'
+PORTAL_HOST = os.environ.get('XSIGN_PORTAL_HOST', '').strip() or DEFAULT_PORTAL_HOST
 MAX_PORTAL_IPA_SIZE = 200 * 1024 * 1024
 
 
@@ -820,7 +1020,11 @@ def prepare_profiles(
 
 def process_job(xs: XSignClient, apple: AppleClient, job: dict[str, Any]) -> None:
     job_id = str(job['id'])
-    with tempfile.TemporaryDirectory(prefix=f'xsign-{job_id[:8]}-') as td:
+    REDACTOR.register(str(job.get('udid') or ''))
+    REDACTOR.register(job.get('sourceUrl'))
+    REDACTOR.register(job.get('callbackUrl'))
+    REDACTOR.register(job.get('signingToken'))
+    with tempfile.TemporaryDirectory(prefix='xsign-') as td:
         work = Path(td)
         input_ipa = work / 'input.ipa'
         output_ipa = work / 'signed.ipa'
@@ -905,36 +1109,235 @@ def inspect_only(ipa_path: str, bundle_prefix: str) -> int:
     return 0
 
 
-def main() -> int:
+FALLBACK_REQUIRED_ENV_VARS: tuple[str, ...] = (
+    'APPLE_ISSUER_ID',
+    'APPLE_KEY_ID',
+    'APPLE_PRIVATE_KEY',
+    'APPLE_P12_BASE64',
+    'APPLE_P12_PASSWORD',
+    'SIGNING_API_BASE',
+    'SIGNING_API_TOKEN',
+)
+FALLBACK_SECRET_LABELS: frozenset[str] = frozenset(FALLBACK_REQUIRED_ENV_VARS)
+
+
+class MissingSecretsError(WorkerError):
+    def __init__(self, missing: list[str]) -> None:
+        self.missing = [name for name in missing if name in FALLBACK_SECRET_LABELS]
+        super().__init__(
+            'Direct Apple signing fallback is not configured; missing secrets: '
+            + ', '.join(self.missing)
+        )
+
+
+def check_fallback_secrets() -> list[str]:
+    return [name for name in FALLBACK_REQUIRED_ENV_VARS if not os.environ.get(name, '').strip()]
+
+
+def missing_secret_message(name: str) -> str:
+    # Only fixed, whitelisted environment-variable names are ever reported.
+    label = name if name in FALLBACK_SECRET_LABELS else 'UNKNOWN'
+    return 'Direct Apple signing fallback unavailable; missing: ' + label
+
+
+def run_fallback_direct_signing() -> int:
+    missing = check_fallback_secrets()
+    if missing:
+        jlog(
+            'fallback_unavailable',
+            missing_count=len(missing),
+            message='Fallback signing disabled; jobs stay queued for the XSign worker.',
+        )
+        for name in missing:
+            if name in FALLBACK_SECRET_LABELS:
+                jlog('fallback_secret_missing', secret_name=name)
+        return 0
+    for name in ('APPLE_PRIVATE_KEY', 'APPLE_P12_BASE64', 'APPLE_P12_PASSWORD', 'SIGNING_API_TOKEN'):
+        REDACTOR.register(os.environ.get(name))
+    jlog(
+        'fallback_not_implemented',
+        message='Direct Apple signing secrets detected, but the fallback path requires '
+                'SIGNING_API_BASE job orchestration that is not implemented in this worker. '
+                'Jobs stay queued; do not mark them as signed.',
+    )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument('--max-jobs', type=int, default=5)
     parser.add_argument('--inspect-ipa')
     parser.add_argument('--bundle-prefix', default=DEFAULT_BUNDLE_PREFIX)
-    args = parser.parse_args()
+    parser.add_argument('--health-check', action='store_true', help='Probe XSign reachability without claiming a job and exit.')
+    parser.add_argument('--dry-run', action='store_true', help='Exercise one claim cycle without marking any job completed.')
+    parser.add_argument('--fallback', action='store_true', help='Run the direct Apple signing fallback path.')
+    parser.add_argument('--max-retry-seconds', type=float, default=RETRY_MAX_DURATION_SECONDS, help='Maximum backoff budget per XSign API call.')
+    return parser
+
+
+def health_check(args: argparse.Namespace) -> int:
+    xs = XSignClient(max_retry_seconds=min(args.max_retry_seconds, HEALTH_RETRY_MAX_DURATION_SECONDS))
+    try:
+        xs.health_check()
+    except RetryableAPIError as exc:
+        jlog('health_check', status='unavailable', error=str(exc)[:200])
+        return 1
+    except WorkerError as exc:
+        jlog('health_check', status='failed', error=str(exc)[:200])
+        return 1
+    jlog('health_check', status='ok', base_url=xs.base)
+    return 0
+
+
+def github_summary_lines(summary: dict[str, Any]) -> list[str]:
+    lines = [
+        '## XSign worker run',
+        '',
+        f"- Runner: `{summary.get('runner', 'github-macos')}`",
+        f"- XSign health: `{summary.get('health', 'unknown')}`",
+        f"- Jobs claimed: **{summary.get('claimed', 0)}**",
+        f"- Jobs completed: **{summary.get('completed', 0)}**",
+        f"- Jobs deferred: **{summary.get('deferred', 0)}**",
+        f"- Jobs failed: **{summary.get('failed', 0)}**",
+        f"- XSign API requests: {summary.get('requests', 0)}",
+    ]
+    missing = summary.get('fallback_missing')
+    if missing:
+        for name in missing:
+            if name in FALLBACK_SECRET_LABELS:
+                lines.append('- Fallback secret missing: `' + name + '`')
+    return lines
+
+
+def write_github_summary(summary: dict[str, Any]) -> None:
+    path = os.environ.get('GITHUB_STEP_SUMMARY', '').strip()
+    if not path:
+        return
+    rendered = github_summary_lines(summary)
+    try:
+        with open(path, 'a', encoding='utf-8') as handle:
+            for line in rendered:
+                handle.write(line + '\n')
+    except OSError as exc:
+        jlog('summary_write_failed', error=str(exc))
+
+
+def run_worker(args: argparse.Namespace) -> int:
+    xs = XSignClient(max_retry_seconds=args.max_retry_seconds)
+    apple = AppleClient(xs)
+    summary: dict[str, Any] = {
+        'runner': os.environ.get('RUNNER_NAME', 'github-macos'),
+        'health': 'unknown',
+        'claimed': 0,
+        'completed': 0,
+        'deferred': 0,
+        'failed': 0,
+        'requests': 0,
+    }
+    exit_code = 0
+    try:
+        jlog('worker_start', base_url=xs.base, version=WORKER_VERSION)
+        xs.heartbeat()
+        xs.apple('ping')
+        summary['health'] = 'ok'
+        jlog('worker_ready', message='Heartbeat and Apple credentials verified; polling queue.')
+        budget = max(1, min(args.max_jobs, 10))
+        processed = 0
+        while processed < budget:
+            job = xs.claim()
+            if not job:
+                jlog('queue_empty', message='No queued XSign jobs.')
+                break
+            job_id = str(job.get('id') or '')
+            if not job_id:
+                summary['failed'] += 1
+                jlog('job_invalid', message='Claimed job has no id; skipping.')
+                break
+            summary['claimed'] += 1
+            jlog('job_claimed', job_id=job_id)
+            try:
+                process_job(xs, apple, job)
+            except RetryableAPIError as exc:
+                summary['deferred'] += 1
+                summary['claimed'] -= 1
+                jlog('job_deferred', job_id=job_id, error=str(exc)[:200])
+                break
+            except Exception as exc:
+                summary['failed'] += 1
+                message = REDACTOR.scrub(str(exc) or exc.__class__.__name__)
+                jlog('job_failed', job_id=job_id, error=message[:300])
+                report_portal_failure(job, message)
+                xs.fail(job_id, message)
+            else:
+                summary['completed'] += 1
+                jlog('job_completed', job_id=job_id)
+            processed += 1
+            try:
+                xs.heartbeat()
+            except RetryableAPIError as exc:
+                jlog('heartbeat_degraded', error=str(exc)[:200])
+                if processed < budget:
+                    summary['deferred'] += 1
+                break
+    except DeferJobs as exc:
+        summary['deferred'] += 1
+        jlog('worker_deferred', message=str(exc)[:300])
+    except RetryableAPIError as exc:
+        summary['deferred'] += 1
+        jlog('worker_deferred', error=str(exc)[:300])
+    except WorkerError as exc:
+        exit_code = 1
+        jlog('worker_error', error=str(exc)[:300])
+    finally:
+        summary['requests'] = xs.request_count
+        missing = check_fallback_secrets()
+        if missing:
+            summary['fallback_missing'] = missing
+        write_github_summary(summary)
+        jlog(
+            'worker_summary',
+            claimed=summary['claimed'],
+            completed=summary['completed'],
+            deferred=summary['deferred'],
+            failed=summary['failed'],
+            health=summary['health'],
+            requests=summary['requests'],
+        )
+    return exit_code
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     if args.inspect_ipa:
         return inspect_only(args.inspect_ipa, args.bundle_prefix)
+    if args.health_check:
+        return health_check(args)
+    if args.fallback:
+        return run_fallback_direct_signing()
+    if args.dry_run:
+        return run_dry_run(args)
+    return run_worker(args)
 
-    xs = XSignClient()
-    apple = AppleClient(xs)
+
+def run_dry_run(args: argparse.Namespace) -> int:
+    xs = XSignClient(max_retry_seconds=min(args.max_retry_seconds, HEALTH_RETRY_MAX_DURATION_SECONDS))
     xs.heartbeat()
     xs.apple('ping')
-    print('Apple API credentials verified.')
-    processed = 0
-    while processed < max(1, min(args.max_jobs, 10)):
-        job = xs.claim()
-        if not job:
-            print('No queued XSign jobs.')
-            break
-        try:
-            process_job(xs, apple, job)
-        except Exception as exc:
-            message = str(exc) or exc.__class__.__name__
-            print(f"[{job['id']}] FAILED: {message}")
-            report_portal_failure(job, message)
-            xs.fail(str(job['id']), message)
-        processed += 1
-        xs.heartbeat()
+    job = xs.claim()
+    if not job:
+        jlog('dry_run', result='queue_empty', message='Heartbeat ok; no job available to dry-run.')
+        return 0
+    job_id = str(job.get('id') or '')
+    jlog(
+        'dry_run',
+        result='would_process',
+        job_id=job_id,
+        udid_present=bool(str(job.get('udid') or '').strip()),
+        callback=bool(str(job.get('callbackUrl') or '').strip()),
+        filename=str(job.get('filename') or ''),
+    )
+    jlog('dry_run', result='deferred', job_id=job_id, message='Dry-run complete; job left in place.')
     return 0
 
 
