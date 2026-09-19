@@ -12,6 +12,7 @@ import re
 import secrets as pysecrets
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.parse
@@ -1136,7 +1137,7 @@ def check_fallback_secrets() -> list[str]:
 def missing_secret_message(name: str) -> str:
     # Only fixed, whitelisted environment-variable names are ever reported.
     label = name if name in FALLBACK_SECRET_LABELS else 'UNKNOWN'
-    return f'Direct Apple signing fallback unavailable; missing: {label}'
+    return 'Direct Apple signing fallback unavailable; missing: ' + label
 
 
 def run_fallback_direct_signing() -> int:
@@ -1144,11 +1145,11 @@ def run_fallback_direct_signing() -> int:
     if missing:
         jlog(
             'fallback_unavailable',
-            missing_secrets=missing,
+            missing_count=len(missing),
             message='Fallback signing disabled; jobs stay queued for the XSign worker.',
         )
         for name in missing:
-            print(missing_secret_message(name), flush=True)
+            sys.stdout.write(missing_secret_message(name) + '\n')
         return 0
     for name in ('APPLE_PRIVATE_KEY', 'APPLE_P12_BASE64', 'APPLE_P12_PASSWORD', 'SIGNING_API_TOKEN'):
         REDACTOR.register(os.environ.get(name))
@@ -1206,11 +1207,12 @@ def write_github_summary(summary: dict[str, Any]) -> None:
     if missing:
         for name in missing:
             if name in FALLBACK_SECRET_LABELS:
-                lines.append(f'- Fallback secret missing: `{name}`')
+                lines.append('- Fallback secret missing: `' + name + '`')
     try:
         with open(path, 'a', encoding='utf-8') as handle:
-            handle.write('\n'.join(lines))
-            handle.write('\n')
+            for line in lines:
+                handle.write(line)
+                handle.write('\n')
     except OSError as exc:
         jlog('summary_write_failed', error=str(exc))
 
