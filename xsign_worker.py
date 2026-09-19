@@ -27,7 +27,7 @@ import requests
 CHUNK_SIZE = 384 * 1024
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
 WORKER_VERSION = '3.3.0'
-DEFAULT_XSIGN_BASE_URL = 'https://api-v2.appdeploy.ai/app/xsign-0xcfp9'
+DEFAULT_XSIGN_BASE_URL = 'https://xsign-0xcfp9.v2.appdeploy.ai'
 JOB_LOG_LIMIT = 8
 
 # Transient XSign infrastructure statuses. A 402 carrying the code
@@ -132,8 +132,18 @@ def configured_xsign_base_url() -> str:
             'config_default_base_url',
             message='XSIGN_BASE_URL is not configured; using the built-in default endpoint.',
         )
-        return DEFAULT_XSIGN_BASE_URL
-    return base.rstrip('/')
+        base = DEFAULT_XSIGN_BASE_URL
+    base = base.rstrip('/')
+    legacy = re.fullmatch(r'https://api-v2\\.appdeploy\\.ai/app/([A-Za-z0-9-]+)', base)
+    if legacy:
+        normalized = f'https://{legacy.group(1)}.v2.appdeploy.ai'
+        jlog(
+            'config_legacy_base_url_normalized',
+            configured_base=base,
+            effective_base=normalized,
+        )
+        return normalized
+    return base
 
 
 def sleep_with_jitter(delay: float) -> None:
@@ -207,11 +217,18 @@ class XSignClient:
         self.max_retry_seconds = max(1.0, float(max_retry_seconds))
         self.request_count = 0
         self.s = requests.Session()
-        self.s.headers.update({
-            'Authorization': f'******',
+        headers = {
             'Accept': 'application/json',
             'User-Agent': f'XSign-GitHub-Worker/{WORKER_VERSION}',
-        })
+        }
+        if os.environ.get('ACTIONS_ID_TOKEN_REQUEST_URL') and os.environ.get('ACTIONS_ID_TOKEN_REQUEST_TOKEN'):
+            headers['Authorization'] = f'Bearer {github_oidc_token()}'
+        else:
+            worker_secret = os.environ.get('XSIGN_WORKER_SECRET', '').strip()
+            if worker_secret:
+                REDACTOR.register(worker_secret)
+                headers['X-XSign-Worker-Secret'] = worker_secret
+        self.s.headers.update(headers)
 
     def _decode(self, response: requests.Response) -> dict[str, Any]:
         try:
@@ -1151,7 +1168,7 @@ def run_fallback_direct_signing() -> int:
         for name in missing:
             if name in FALLBACK_SECRET_LABELS:
                 jlog('fallback_secret_missing', secret_name=name)
-        return 0
+        return 2
     for name in ('APPLE_PRIVATE_KEY', 'APPLE_P12_BASE64', 'APPLE_P12_PASSWORD', 'SIGNING_API_TOKEN'):
         REDACTOR.register(os.environ.get(name))
     jlog(
@@ -1160,7 +1177,7 @@ def run_fallback_direct_signing() -> int:
                 'SIGNING_API_BASE job orchestration that is not implemented in this worker. '
                 'Jobs stay queued; do not mark them as signed.',
     )
-    return 0
+    return 3
 
 
 def build_parser() -> argparse.ArgumentParser:
