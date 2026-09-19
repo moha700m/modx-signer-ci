@@ -1149,7 +1149,8 @@ def run_fallback_direct_signing() -> int:
             message='Fallback signing disabled; jobs stay queued for the XSign worker.',
         )
         for name in missing:
-            sys.stdout.write(missing_secret_message(name) + '\n')
+            if name in FALLBACK_SECRET_LABELS:
+                jlog('fallback_secret_missing', secret_name=name)
         return 0
     for name in ('APPLE_PRIVATE_KEY', 'APPLE_P12_BASE64', 'APPLE_P12_PASSWORD', 'SIGNING_API_TOKEN'):
         REDACTOR.register(os.environ.get(name))
@@ -1188,10 +1189,7 @@ def health_check(args: argparse.Namespace) -> int:
     return 0
 
 
-def write_github_summary(summary: dict[str, Any]) -> None:
-    path = os.environ.get('GITHUB_STEP_SUMMARY', '').strip()
-    if not path:
-        return
+def github_summary_lines(summary: dict[str, Any]) -> list[str]:
     lines = [
         '## XSign worker run',
         '',
@@ -1208,11 +1206,18 @@ def write_github_summary(summary: dict[str, Any]) -> None:
         for name in missing:
             if name in FALLBACK_SECRET_LABELS:
                 lines.append('- Fallback secret missing: `' + name + '`')
+    return lines
+
+
+def write_github_summary(summary: dict[str, Any]) -> None:
+    path = os.environ.get('GITHUB_STEP_SUMMARY', '').strip()
+    if not path:
+        return
     try:
-        with open(path, 'a', encoding='utf-8') as handle:
-            for line in lines:
-                handle.write(line)
-                handle.write('\n')
+        handle = open(path, 'a', encoding='utf-8')
+        with handle:
+            for line in github_summary_lines(summary):
+                handle.write(line + '\n')
     except OSError as exc:
         jlog('summary_write_failed', error=str(exc))
 
