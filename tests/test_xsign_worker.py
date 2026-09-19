@@ -34,6 +34,16 @@ def _client(max_retry_seconds: float = 5.0) -> xw.XSignClient:
     return client
 
 
+class ConfigurationTests(unittest.TestCase):
+    def test_legacy_appdeploy_worker_url_is_normalized(self) -> None:
+        with mock.patch.dict(os.environ, {'XSIGN_BASE_URL': 'https://api-v2.appdeploy.ai/app/xsign-demo'}, clear=False):
+            self.assertEqual(xw.configured_xsign_base_url(), 'https://xsign-demo.v2.appdeploy.ai')
+
+    def test_current_appdeploy_url_is_preserved(self) -> None:
+        with mock.patch.dict(os.environ, {'XSIGN_BASE_URL': 'https://xsign-demo.v2.appdeploy.ai'}, clear=False):
+            self.assertEqual(xw.configured_xsign_base_url(), 'https://xsign-demo.v2.appdeploy.ai')
+
+
 class RetryBehaviorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.sleeps: list[float] = []
@@ -277,7 +287,7 @@ class FallbackSecretTests(unittest.TestCase):
         buf = io.StringIO()
         with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(buf):
             code = xw.run_fallback_direct_signing()
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 2)
         out = buf.getvalue()
         self.assertIn('missing', out.lower())
         self.assertNotIn('signed successfully', out.lower())
