@@ -26,8 +26,8 @@ import requests
 
 CHUNK_SIZE = 384 * 1024
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
-WORKER_VERSION = '3.3.1'
-DEFAULT_XSIGN_BASE_URL = 'https://xsign-0xcfp9.v2.appdeploy.ai'
+WORKER_VERSION = '3.3.2'
+DEFAULT_XSIGN_BASE_URL = 'https://api-v2.appdeploy.ai/app/xsign-0xcfp9'
 JOB_LOG_LIMIT = 8
 
 # Transient XSign infrastructure statuses. A 402 carrying the code
@@ -133,16 +133,6 @@ def configured_xsign_base_url() -> str:
             message='XSIGN_BASE_URL is not configured; using the built-in default endpoint.',
         )
         base = DEFAULT_XSIGN_BASE_URL
-    legacy_prefix = 'https://api-v2.appdeploy.ai/app/'
-    if base.rstrip('/').startswith(legacy_prefix):
-        app_id = base.rstrip('/')[len(legacy_prefix):].split('/', 1)[0]
-        if app_id:
-            base = f'https://{app_id}.v2.appdeploy.ai'
-            jlog(
-                'config_migrated_base_url',
-                message='Migrated legacy AppDeploy API host to the current app origin.',
-                app_id=app_id,
-            )
     return base.rstrip('/')
 
 
