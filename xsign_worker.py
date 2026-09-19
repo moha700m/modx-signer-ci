@@ -134,7 +134,7 @@ def configured_xsign_base_url() -> str:
         )
         base = DEFAULT_XSIGN_BASE_URL
     base = base.rstrip('/')
-    legacy = re.fullmatch(r'https://api-v2\\.appdeploy\\.ai/app/([A-Za-z0-9-]+)', base)
+    legacy = re.fullmatch(r'https://api-v2\.appdeploy\.ai/app/([A-Za-z0-9-]+)', base)
     if legacy:
         normalized = f'https://{legacy.group(1)}.v2.appdeploy.ai'
         jlog(
