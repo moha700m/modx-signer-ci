@@ -27,7 +27,7 @@ import requests
 CHUNK_SIZE = 384 * 1024
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
 WORKER_VERSION = '3.3.0'
-DEFAULT_XSIGN_BASE_URL = 'https://xsign-0xcfp9.v2.appdeploy.ai'
+DEFAULT_XSIGN_BASE_URL = 'https://api-v2.appdeploy.ai/app/xsign-0xcfp9'
 JOB_LOG_LIMIT = 8
 
 # Transient XSign infrastructure statuses. A 402 carrying the code
@@ -133,17 +133,7 @@ def configured_xsign_base_url() -> str:
             message='XSIGN_BASE_URL is not configured; using the built-in default endpoint.',
         )
         base = DEFAULT_XSIGN_BASE_URL
-    base = base.rstrip('/')
-    legacy = re.fullmatch(r'https://api-v2\.appdeploy\.ai/app/([A-Za-z0-9-]+)', base)
-    if legacy:
-        normalized = f'https://{legacy.group(1)}.v2.appdeploy.ai'
-        jlog(
-            'config_legacy_base_url_normalized',
-            configured_base=base,
-            effective_base=normalized,
-        )
-        return normalized
-    return base
+    return base.rstrip('/')
 
 
 def sleep_with_jitter(delay: float) -> None:
