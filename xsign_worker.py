@@ -26,8 +26,8 @@ import requests
 
 CHUNK_SIZE = 384 * 1024
 DEFAULT_BUNDLE_PREFIX = 'com.moha700m.xsign'
-WORKER_VERSION = '3.3.2'
-DEFAULT_XSIGN_BASE_URL = 'https://api-v2.appdeploy.ai/app/xsign-0xcfp9'
+WORKER_VERSION = '3.4.0'
+DEFAULT_XSIGN_BASE_URL = 'https://gbvopmtmzosqknntaafl.supabase.co/functions/v1/xsign2'
 JOB_LOG_LIMIT = 8
 
 # Transient XSign infrastructure statuses. A 402 carrying the code
@@ -248,7 +248,11 @@ class XSignClient:
             retry_reason: str | None = None
             last_response = None
             try:
-                last_response = self.s.request(method, f'{self.base}{path}', json=json_body, timeout=120)
+                if '.supabase.co/functions/v1/' in self.base:
+                    request_url = f'{self.base}?{urllib.parse.urlencode({"path": path})}'
+                else:
+                    request_url = f'{self.base}{path}'
+                last_response = self.s.request(method, request_url, json=json_body, timeout=120)
                 status_code = last_response.status_code
                 data = self._decode(last_response)
                 if status_code in RETRYABLE_STATUSES and status_code not in allow_statuses:
@@ -600,7 +604,7 @@ def create_signing_identity(xs: XSignClient, apple: AppleClient, p12: Path, work
     ])
     p12_b64 = base64.b64encode(p12.read_bytes()).decode('ascii')
     xs.save_signing_identity(p12_b64, password)
-    jlog('identity_persisted', message='Persisted new XSign signing identity in encrypted AppDeploy storage.')
+    jlog('identity_persisted', message='Persisted new XSign signing identity in encrypted Supabase Vault.')
     return password
 
 
