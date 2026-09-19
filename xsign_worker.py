@@ -1140,11 +1140,8 @@ def run_fallback_direct_signing() -> int:
             missing_secrets=missing,
             message='Fallback signing disabled; jobs stay queued for the XSign worker.',
         )
-        missing_report = ', '.join(missing)
-        print(
-            'Direct Apple signing fallback unavailable; missing: ' + missing_report,
-            flush=True,
-        )
+        for name in missing:
+            print(f'Direct Apple signing fallback unavailable; missing: {name}', flush=True)
         return 0
     for name in ('APPLE_PRIVATE_KEY', 'APPLE_P12_BASE64', 'APPLE_P12_PASSWORD', 'SIGNING_API_TOKEN'):
         REDACTOR.register(os.environ.get(name))
@@ -1200,7 +1197,8 @@ def write_github_summary(summary: dict[str, Any]) -> None:
     ]
     missing = summary.get('fallback_missing')
     if missing:
-        lines.append(f"- Fallback secrets missing: `{', '.join(missing)}`")
+        for name in missing:
+            lines.append(f'- Fallback secret missing: `{name}`')
     try:
         summary_text = '\n'.join(lines) + '\n'
         with open(path, 'a', encoding='utf-8') as handle:
