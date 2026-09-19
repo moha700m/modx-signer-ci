@@ -1,5 +1,11 @@
 name: MOD X Signer
 
+# Direct job runner for the SignTools-style signing API. This workflow signs a
+# single IPA when given a job id, API base, and one-time worker token. It is
+# kept as a manual fallback and for integration with the MOD X service; it does
+# NOT poll the XSign queue and therefore cannot process the current XMOD
+# customer orders. Those orders are served exclusively by xsign-worker.yml.
+
 on:
   workflow_dispatch:
     inputs:
@@ -25,7 +31,7 @@ concurrency:
 
 jobs:
   sign:
-    runs-on: macos-26
+    runs-on: macos-15
     timeout-minutes: 30
     env:
       JOB_ID: ${{ inputs.job_id }}
