@@ -24,7 +24,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     env:
-      XSIGN_BASE_URL: https://gbvopmtmzosqknntaafl.supabase.co/functions/v1/xsign2
+      XSIGN_BASE_URL: https://api-v2.appdeploy.ai/app/xsign-0xcfp9
       APPLE_BUNDLE_PREFIX: ${{ vars.APPLE_BUNDLE_PREFIX || 'com.moha700m.xsign' }}
       XSIGN_PORTAL_HOST: ${{ vars.XSIGN_PORTAL_HOST }}
 
