@@ -196,8 +196,8 @@ def github_oidc_token() -> str:
 
 def _log_response_excerpt(response: requests.Response) -> str:
     text = (response.text or '').strip()
-    if len(text) > 200:
-        text = text[:200] + '...'
+    if len(text) > 1200:
+        text = text[:1200] + '...'
     return text
 
 
