@@ -594,7 +594,7 @@ def create_signing_identity(xs: XSignClient, apple: AppleClient, p12: Path, work
     write_b64_file(cert_content, cert_der, 'Apple certificate content')
     run(['openssl', 'x509', '-inform', 'DER', '-in', str(cert_der), '-out', str(cert_pem)])
     run([
-        'openssl', 'pkcs12', '-legacy', '-export',
+        'openssl', 'pkcs12', '-export',
         '-inkey', str(private_key), '-in', str(cert_pem),
         '-out', str(p12), '-passout', f'pass:{password}',
         '-name', 'XSign Apple Distribution',
@@ -643,7 +643,7 @@ def rewrap_signing_identity(xs: XSignClient, p12: Path, password: str, work: Pat
     new_password = pysecrets.token_hex(36)
     REDACTOR.register(new_password)
     run([
-        'openssl', 'pkcs12', '-legacy', '-export',
+        'openssl', 'pkcs12', '-export',
         '-inkey', str(clean_key), '-in', str(clean_cert),
         '-out', str(compatible_p12), '-passout', f'pass:{new_password}',
         '-name', 'XSign Apple Distribution',
