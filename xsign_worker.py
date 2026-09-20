@@ -360,6 +360,12 @@ class XSignClient:
         except Exception as exc:
             print(f'Could not report failure to XSign: {exc}')
 
+    def defer(self, job_id: str, message: str) -> None:
+        try:
+            self.request('POST', f'/api/worker/jobs/{job_id}/defer', json_body={'message': message[:500]})
+        except Exception as exc:
+            jlog('job_defer_report_failed', job_id=job_id, error=str(exc)[:200])
+
     def apple(self, action: str, **kwargs: Any) -> dict[str, Any]:
         _, data = self.request('POST', '/api/worker/apple', json_body={'action': action, **kwargs})
         return data
@@ -1271,6 +1277,7 @@ def run_worker(args: argparse.Namespace) -> int:
             except RetryableAPIError as exc:
                 summary['deferred'] += 1
                 summary['claimed'] -= 1
+                xs.defer(job_id, 'مؤقتًا غير متاح؛ ستتم إعادة المحاولة تلقائيًا: ' + str(exc)[:360])
                 jlog('job_deferred', job_id=job_id, error=str(exc)[:200])
                 break
             except Exception as exc:
