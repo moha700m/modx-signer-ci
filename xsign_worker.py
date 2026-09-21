@@ -1052,7 +1052,11 @@ def prepare_profiles(
         spec.bundle_resource_id = apple.get_or_create_bundle_id(spec.new_id, spec.display_name)
         if spec.needs_push:
             apple.ensure_capability(spec.bundle_resource_id, 'PUSH_NOTIFICATIONS')
-        profile_name = f"XSign-{hashlib.sha1(spec.new_id.encode()).hexdigest()[:10]}-{udid[-8:]}-{cert_resource[-6:]}-{pysecrets.token_hex(4).upper()}"
+        # Keep one stable profile name per app/device/certificate. A random
+        # suffix created a new Apple profile on every retry and could exhaust
+        # the team's profile quota during a transient signing outage.
+        device_key = hashlib.sha256(udid.encode()).hexdigest()[:12].upper()
+        profile_name = f"XSign-{hashlib.sha1(spec.new_id.encode()).hexdigest()[:10]}-{device_key}-{cert_resource[-6:]}"
         profile_bytes, expiration = apple.get_or_create_profile(
             profile_name,
             spec.bundle_resource_id,
