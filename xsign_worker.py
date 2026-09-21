@@ -48,9 +48,17 @@ class WorkerError(RuntimeError):
 class RetryableAPIError(WorkerError):
     """A transient XSign API failure that is safe to retry with backoff."""
 
-    def __init__(self, message: str, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        code: str | None = None,
+        retry_after_seconds: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
+        self.retry_after_seconds = retry_after_seconds
 
 
 class DeferJobs(WorkerError):
@@ -267,6 +275,26 @@ class XSignClient:
                     error=exc.__class__.__name__,
                 )
             self.request_count += 1
+            # APPLE_DEVICE_PROCESSING is a structured, job-scoped retry. It is
+            # deliberately recognized only on the Apple worker endpoint and is
+            # never retried by the generic HTTP loop: the API has already told
+            # us when the device lease should be tried again.
+            if (
+                status_code == 409
+                and path == '/api/worker/apple'
+                and data.get('code') == 'APPLE_DEVICE_PROCESSING'
+            ):
+                retry_after = data.get('retryAfterSeconds')
+                try:
+                    retry_after = max(1, int(retry_after))
+                except (TypeError, ValueError):
+                    retry_after = None
+                raise RetryableAPIError(
+                    f'Apple device is still processing; retry after {retry_after or 900}s',
+                    status_code=409,
+                    code='APPLE_DEVICE_PROCESSING',
+                    retry_after_seconds=retry_after,
+                )
             if retry_reason is None:
                 jlog(
                     'http_request',
@@ -360,11 +388,13 @@ class XSignClient:
         except Exception as exc:
             print(f'Could not report failure to XSign: {exc}')
 
-    def defer(self, job_id: str, message: str) -> None:
+    def defer(self, job_id: str, message: str) -> bool:
         try:
             self.request('POST', f'/api/worker/jobs/{job_id}/defer', json_body={'message': message[:500]})
+            return True
         except Exception as exc:
             jlog('job_defer_report_failed', job_id=job_id, error=str(exc)[:200])
+            return False
 
     def apple(self, action: str, **kwargs: Any) -> dict[str, Any]:
         _, data = self.request('POST', '/api/worker/apple', json_body={'action': action, **kwargs})
@@ -1047,6 +1077,12 @@ def process_job(xs: XSignClient, apple: AppleClient, job: dict[str, Any]) -> Non
         output_ipa = work / 'signed.ipa'
         p12 = work / 'distribution.p12'
 
+        xs.status(job_id, 'registering_device', 'التحقق من جهاز iPhone لدى Apple Developer')
+        # Device registration is intentionally the first Apple operation. A
+        # device that is still PROCESSING must release this job quickly so a
+        # later queued job can be claimed by the same worker.
+        device_id = apple.get_or_register_device(str(job['udid']), str(job.get('deviceName') or 'XSign iPhone'))
+
         xs.status(job_id, 'registering_device', 'تنزيل IPA وفحص بنية التطبيق')
         download_input(xs, job, input_ipa)
         prefix = os.environ.get('APPLE_BUNDLE_PREFIX', DEFAULT_BUNDLE_PREFIX).strip() or DEFAULT_BUNDLE_PREFIX
@@ -1065,9 +1101,6 @@ def process_job(xs: XSignClient, apple: AppleClient, job: dict[str, Any]) -> Non
             p12_password = rewrap_signing_identity(xs, p12, p12_password, work)
             keychain, identity, serial = import_p12(p12, p12_password, work)
         cert_id = apple.certificate_id_for_serial(serial)
-
-        xs.status(job_id, 'registering_device', 'تسجيل جهاز iPhone لدى Apple Developer')
-        device_id = apple.get_or_register_device(str(job['udid']), str(job.get('deviceName') or 'XSign iPhone'))
 
         xs.status(job_id, 'creating_profile', 'إنشاء App IDs وملفات Provisioning للتطبيق والإضافات')
         prepare_profiles(apple, specs, device_id, cert_id, work, str(job['udid']))
@@ -1258,7 +1291,10 @@ def run_worker(args: argparse.Namespace) -> int:
         xs.apple('ping')
         summary['health'] = 'ok'
         jlog('worker_ready', message='Heartbeat and Apple credentials verified; polling queue.')
-        budget = max(1, min(args.max_jobs, 10))
+        # A bounded per-run budget prevents a warm runner from monopolizing the
+        # queue while still allowing a deferred device job to yield to later
+        # work in the same invocation.
+        budget = max(1, min(int(args.max_jobs), 10))
         processed = 0
         while processed < budget:
             job = xs.claim()
@@ -1271,15 +1307,30 @@ def run_worker(args: argparse.Namespace) -> int:
                 jlog('job_invalid', message='Claimed job has no id; skipping.')
                 break
             summary['claimed'] += 1
+            processed += 1
             jlog('job_claimed', job_id=job_id)
             try:
                 process_job(xs, apple, job)
             except RetryableAPIError as exc:
-                summary['deferred'] += 1
-                summary['claimed'] -= 1
-                xs.defer(job_id, 'مؤقتًا غير متاح؛ ستتم إعادة المحاولة تلقائيًا: ' + str(exc)[:360])
-                jlog('job_deferred', job_id=job_id, error=str(exc)[:200])
-                break
+                deferred = xs.defer(job_id, 'مؤقتًا غير متاح؛ ستتم إعادة المحاولة تلقائيًا: ' + str(exc)[:360])
+                if deferred:
+                    summary['deferred'] += 1
+                jlog(
+                    'job_deferred',
+                    job_id=job_id,
+                    code=exc.code,
+                    retry_after_seconds=exc.retry_after_seconds,
+                    defer_reported=deferred,
+                    error=str(exc)[:200],
+                )
+                if not deferred:
+                    # The claim must remain non-terminal if the defer RPC is
+                    # unavailable. Stop before claiming more work safely.
+                    break
+                if exc.code != 'APPLE_DEVICE_PROCESSING':
+                    # Backend/network outages are run-wide conditions. A
+                    # device-specific processing lease is safe to skip once.
+                    break
             except Exception as exc:
                 summary['failed'] += 1
                 message = REDACTOR.scrub(str(exc) or exc.__class__.__name__)
@@ -1289,19 +1340,14 @@ def run_worker(args: argparse.Namespace) -> int:
             else:
                 summary['completed'] += 1
                 jlog('job_completed', job_id=job_id)
-            processed += 1
             try:
                 xs.heartbeat()
             except RetryableAPIError as exc:
                 jlog('heartbeat_degraded', error=str(exc)[:200])
-                if processed < budget:
-                    summary['deferred'] += 1
                 break
     except DeferJobs as exc:
-        summary['deferred'] += 1
         jlog('worker_deferred', message=str(exc)[:300])
     except RetryableAPIError as exc:
-        summary['deferred'] += 1
         jlog('worker_deferred', error=str(exc)[:300])
     except WorkerError as exc:
         exit_code = 1

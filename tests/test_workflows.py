@@ -37,7 +37,7 @@ class WorkflowYamlTests(unittest.TestCase):
     def test_worker_workflow_uses_macos_and_configurable_url(self) -> None:
         text = (REPO_ROOT / '.github' / 'workflows' / 'xsign-worker.yml').read_text()
         self.assertIn('macos-15', text)
-        self.assertIn('vars.XSIGN_BASE_URL', text)
+        self.assertIn('vars.XSIGN_SUPABASE_BASE_URL', text)
         self.assertNotIn('https://api-v2.appdeploy.ai/app/xsign-0xcfp9', text,
                          'XSIGN_BASE_URL must come from a variable, not a hardcoded URL')
 

@@ -18,7 +18,7 @@ apps.
 Customer website (XMOD store)
         |  order created
         v
-XSign API (AppDeploy backend, XSIGN_BASE_URL)
+XSign API (Supabase Edge Function, XSIGN_BASE_URL)
         |  POST /api/worker/claim  (queue)
         v
 GitHub Actions macOS runner (macos-15)
@@ -57,8 +57,8 @@ POST {XSIGN_BASE_URL}/api/worker/heartbeat
 was answered with `HTTP 402` and the body code `APP_TEMPORARILY_UNAVAILABLE`.
 In this API, 402 is **not** a payment rejection of a customer order — it is the
 backend's signal that the signing engine deployment is temporarily unavailable
-(e.g. the AppDeploy deployment was marked "ready" before the worker API routes
-were actually serving, or the route/URL changed).
+(e.g. the backend was marked ready before the worker API routes were actually
+serving, or the route/URL changed).
 
 The old worker treated 402 like any other error: it raised immediately from
 `heartbeat()`, crashed, and the keep-warm loop restarted it every 10 seconds —
@@ -67,7 +67,7 @@ no signing job was picked up and customer orders stayed `pending` forever.
 
 The fix in this repository:
 
-1. `XSIGN_BASE_URL` is now read from the GitHub **variable** `XSIGN_BASE_URL`
+1. `XSIGN_BASE_URL` is now read from the GitHub **variable** `XSIGN_SUPABASE_BASE_URL`
    (repository *Settings → Secrets and variables → Actions → Variables*), so a
    backend URL/route change no longer requires a code commit. If the variable
    is unset, the worker falls back to the previously hardcoded default and logs
@@ -84,9 +84,9 @@ The fix in this repository:
    backend confirms completion; jobs are only marked failed for real signing
    errors — never for infrastructure outages.
 
-Note: "AppDeploy deployment ready" only means the deployment finished; it does
-not prove the worker API is healthy. Always run the health check (below) after
-a backend deploy.
+The deployment status only means the deployment finished; it does not prove the
+worker API is healthy. Always run the health check (below) after a backend
+deploy.
 
 ## Required GitHub configuration
 
@@ -94,7 +94,7 @@ a backend deploy.
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `XSIGN_BASE_URL` | recommended | XSign worker API base, e.g. `https://api-v2.appdeploy.ai/app/xsign-0xcfp9`. Update here when the deployment URL changes. |
+| `XSIGN_SUPABASE_BASE_URL` | recommended | XSign Supabase Edge Function base, e.g. `https://gbvopmtmzosqknntaafl.supabase.co/functions/v1/xsign2`. Update this variable when the Edge Function URL changes. |
 | `APPLE_BUNDLE_PREFIX` | optional | Reverse-DNS bundle prefix used for re-signing (default `com.moha700m.xsign`). |
 | `XSIGN_PORTAL_HOST` | optional | Override the customer portal host that receives signed IPAs. |
 
@@ -103,7 +103,7 @@ a backend deploy.
 The XSign worker authenticates with **GitHub OIDC** (`id-token: write`,
 audience `xsign-worker`); no static token secret is needed. If the backend
 rejects the token with 401/403, verify the configured OIDC audience matches
-`xsign-worker` on the AppDeploy side.
+`xsign-worker` on the Supabase side.
 
 ### Secrets — optional direct Apple fallback
 
@@ -129,7 +129,7 @@ Locally or in CI, without claiming any job:
 
 ```bash
 python3 -m pip install -r requirements-xsign.txt
-XSIGN_BASE_URL="https://api-v2.appdeploy.ai/app/xsign-0xcfp9" \
+XSIGN_BASE_URL="https://gbvopmtmzosqknntaafl.supabase.co/functions/v1/xsign2" \
   python3 xsign_worker.py --health-check
 ```
 
@@ -151,7 +151,7 @@ Deferred jobs are never removed from the XSign queue and never marked failed —
 they simply stay `pending`. To requeue:
 
 1. Fix the underlying condition (e.g. update `XSIGN_BASE_URL`, or wait for the
-   AppDeploy worker API to recover).
+   worker API to recover).
 2. Run the health check above until it exits `0`.
 3. Either wait for the next scheduled run (every 5 minutes) or trigger
    **Actions → XSign macOS Signing Worker → Run workflow** manually.

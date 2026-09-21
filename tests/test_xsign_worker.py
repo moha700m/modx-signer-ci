@@ -76,6 +76,20 @@ class RetryBehaviorTests(unittest.TestCase):
                 client.request('POST', '/api/worker/heartbeat')
         self.assertEqual(ctx.exception.status_code, 402)
 
+    def test_structured_device_processing_409_is_one_call(self) -> None:
+        client = _client()
+        response = _FakeResponse(409, {
+            'error': 'Apple device registration is still processing',
+            'code': 'APPLE_DEVICE_PROCESSING',
+            'retryAfterSeconds': 900,
+        })
+        with mock.patch.object(client.s, 'request', return_value=response) as req:
+            with self.assertRaises(xw.RetryableAPIError) as ctx:
+                client.request('POST', '/api/worker/apple', json_body={'action': 'device.ensure'})
+        self.assertEqual(req.call_count, 1)
+        self.assertEqual(ctx.exception.code, 'APPLE_DEVICE_PROCESSING')
+        self.assertEqual(ctx.exception.retry_after_seconds, 900)
+
     def test_retry_budget_is_bounded(self) -> None:
         client = _client(max_retry_seconds=3.0)
         clock = iter([0.0] + [x * 0.4 for x in range(1, 40)])
@@ -173,6 +187,53 @@ class HeartbeatGateTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(completed, [], 'Deferred jobs must not call complete() or fail().')
 
+    def test_device_processing_defers_then_processes_next_job(self) -> None:
+        client = _client()
+        args = types.SimpleNamespace(max_jobs=3, max_retry_seconds=5.0)
+        first = {'id': 'job-a', 'udid': 'a' * 40, 'filename': 'a.ipa'}
+        second = {'id': 'job-b', 'udid': 'b' * 40, 'filename': 'b.ipa'}
+        claims = iter([first, second, None])
+        effects = [
+            xw.RetryableAPIError('device is processing', status_code=409, code='APPLE_DEVICE_PROCESSING', retry_after_seconds=900),
+            None,
+        ]
+        with mock.patch.object(xw, 'XSignClient', return_value=client), \
+             mock.patch.object(xw, 'AppleClient', autospec=True), \
+             mock.patch.object(client.s, 'request', return_value=_FakeResponse(200, {'ok': 1})), \
+             mock.patch.object(client, 'claim', side_effect=lambda: next(claims)), \
+             mock.patch.object(client, 'defer', return_value=True) as defer_mock, \
+             mock.patch.object(xw, 'process_job', side_effect=effects), \
+             mock.patch.object(xw, 'write_github_summary'), \
+             mock.patch.object(xw, 'check_fallback_secrets', return_value=[]):
+            summary: dict = {}
+            with mock.patch.object(xw, 'write_github_summary', side_effect=lambda value: summary.update(value)):
+                code = xw.run_worker(args)
+        self.assertEqual(code, 0)
+        self.assertEqual(summary['claimed'], 2)
+        self.assertEqual(summary['deferred'], 1)
+        self.assertEqual(summary['completed'], 1)
+        defer_mock.assert_called_once()
+
+    def test_failed_defer_stops_without_terminal_update(self) -> None:
+        client = _client()
+        args = types.SimpleNamespace(max_jobs=3, max_retry_seconds=5.0)
+        job = {'id': 'job-a', 'udid': 'a' * 40, 'filename': 'a.ipa'}
+        with mock.patch.object(xw, 'XSignClient', return_value=client), \
+             mock.patch.object(xw, 'AppleClient', autospec=True), \
+             mock.patch.object(client.s, 'request', return_value=_FakeResponse(200, {'ok': 1})), \
+             mock.patch.object(client, 'claim', return_value=job) as claim_mock, \
+             mock.patch.object(client, 'defer', return_value=False), \
+             mock.patch.object(xw, 'process_job', side_effect=xw.RetryableAPIError('outage', status_code=503)), \
+             mock.patch.object(client, 'complete') as complete_mock, \
+             mock.patch.object(client, 'fail') as fail_mock, \
+             mock.patch.object(xw, 'write_github_summary'), \
+             mock.patch.object(xw, 'check_fallback_secrets', return_value=[]):
+            code = xw.run_worker(args)
+        self.assertEqual(code, 0)
+        claim_mock.assert_called_once()
+        complete_mock.assert_not_called()
+        fail_mock.assert_not_called()
+
 
 class RedactionTests(unittest.TestCase):
     def test_registered_secret_is_scrubbed(self) -> None:
@@ -228,8 +289,12 @@ class HealthCheckTests(unittest.TestCase):
     def test_health_check_degraded(self) -> None:
         client = _client(max_retry_seconds=1.0)
         args = types.SimpleNamespace(max_retry_seconds=1.0)
+        clock = iter([0.0, 0.6, 1.2])
+        buf = io.StringIO()
         with mock.patch.object(xw, 'XSignClient', return_value=client), \
-             mock.patch.object(client.s, 'request', return_value=_FakeResponse(402, {'code': 'APP_TEMPORARILY_UNAVAILABLE'})):
+             mock.patch.object(client.s, 'request', return_value=_FakeResponse(402, {'code': 'APP_TEMPORARILY_UNAVAILABLE'})), \
+             mock.patch.object(xw.time, 'monotonic', side_effect=lambda: next(clock)), \
+             contextlib.redirect_stdout(buf):
             self.assertEqual(xw.health_check(args), 1)
 
 
