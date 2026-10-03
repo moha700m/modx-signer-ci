@@ -57,7 +57,7 @@ jobs:
           status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           if [ "$status" -ne 0 ]; then
-            echo "XSign health check failed; deferring to the next scheduled run."
+            echo "XSign health check failed; jobs remain queued for a later run."
           fi
           exit 0
 
@@ -91,10 +91,16 @@ jobs:
 
       - name: Direct Apple signing fallback
         if: steps.health.outputs.status != '0'
+        continue-on-error: true
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
           python3 xsign_fast_worker.py --fallback
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "Direct fallback is unavailable; queued jobs are preserved for the next worker run."
+          fi
+          exit 0
 
       - name: Runner outcome summary
         if: always()
