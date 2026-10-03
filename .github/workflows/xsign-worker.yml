@@ -8,6 +8,7 @@ on:
     branches: [main]
     paths:
       - 'xsign_worker.py'
+      - 'xsign_fast_worker.py'
       - 'requirements-xsign.txt'
       - '.github/workflows/xsign-worker.yml'
 
@@ -24,7 +25,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     env:
-      XSIGN_BASE_URL: ${{ vars.XSIGN_SUPABASE_BASE_URL || 'https://gbvopmtmzosqknntaafl.supabase.co/functions/v1/xsign2' }}
+      XSIGN_BASE_URL: https://xsign-0xcfp9.v2.appdeploy.ai
       APPLE_BUNDLE_PREFIX: ${{ vars.APPLE_BUNDLE_PREFIX || 'com.moha700m.xsign' }}
       XSIGN_PORTAL_HOST: ${{ vars.XSIGN_PORTAL_HOST }}
 
@@ -44,15 +45,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile xsign_worker.py
-          echo "Worker source compiles."
+          python3 -m py_compile xsign_worker.py xsign_fast_worker.py
+          echo "Worker sources compile."
 
       - name: XSign health check
         id: health
         shell: bash
         run: |
           set +e
-          python3 xsign_worker.py --health-check --max-retry-seconds 30
+          python3 xsign_fast_worker.py --health-check --max-retry-seconds 30
           status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           if [ "$status" -ne 0 ]; then
@@ -69,7 +70,7 @@ jobs:
           exit_code=0
           while (( SECONDS - started < 240 )); do
             echo "Polling XSign signing queue..."
-            python3 xsign_worker.py --max-jobs 10
+            python3 xsign_fast_worker.py --max-jobs 10
             rc=$?
             if [ "$rc" -ne 0 ]; then
               exit_code=$rc
@@ -80,7 +81,7 @@ jobs:
             if (( remaining <= 0 )); then
               break
             fi
-            sleep_for=10
+            sleep_for=5
             if (( remaining < sleep_for )); then
               sleep_for=$remaining
             fi
@@ -93,7 +94,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 xsign_worker.py --fallback
+          python3 xsign_fast_worker.py --fallback
 
       - name: Runner outcome summary
         if: always()
@@ -110,7 +111,9 @@ jobs:
             else
               echo "- XSign health: **unavailable (deferred)**"
             fi
-            echo "- Schedule: every 5 minutes (cron \`*/5 * * * *\`)"
-            echo "- Manual dispatch: enabled (workflow_dispatch)"
+            echo "- Backend: **AppDeploy XSign**"
+            echo "- Schedule fallback: every 5 minutes (cron \`*/5 * * * *\`)"
+            echo "- Manual/immediate dispatch: enabled (workflow_dispatch)"
+            echo "- Warm queue polling: every 5 seconds"
             echo "- Concurrency: single active run per \`xsign-signing-worker\` group"
           } >> "$GITHUB_STEP_SUMMARY"
