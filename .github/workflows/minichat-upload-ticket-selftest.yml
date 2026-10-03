@@ -9,7 +9,7 @@ jobs:
   selftest:
     runs-on: ubuntu-latest
     steps:
-      - name: Verify signed TUS upload ticket
+      - name: Verify signed upload ticket
         run: |
           set -euo pipefail
           BODY="$(curl -fsS 'https://gbvopmtmzosqknntaafl.supabase.co/functions/v1/minichat-upload-ticket/selftest')"
@@ -18,7 +18,8 @@ jobs:
           import json,sys
           d=json.loads(sys.argv[1])
           assert d.get('ok') is True, d
-          assert d.get('status') == 201, d
+          assert d.get('stage') == 'standard', d
+          assert d.get('standardOk') is True, d
           assert d.get('dots') == 2, d
-          print('upload ticket selftest passed')
+          print('signed upload ticket selftest passed')
           PY
