@@ -1,0 +1,25 @@
+name: Minichat Profile Smoke
+on:
+  push:
+    branches: [minichat-fast-install]
+    paths: ['.github/workflows/minichat-profile-smoke.yml']
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check profile service health
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 3 --max-time 30 'https://gbvopmtmzosqknntaafl.supabase.co/functions/v1/minichat-device-profile/health' -o health.json
+          python - <<'PY'
+          import json
+          x=json.load(open('health.json'))
+          assert x.get('ok') is True, x
+          assert x.get('parser') == 'cms-plist-v2', x
+          PY
+      - name: Check generated profile callback
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 3 --max-time 30 'https://gbvopmtmzosqknntaafl.supabase.co/functions/v1/minichat-device-profile/profile?id=c3730bbb-ed80-49c2-875c-de986f81389a' -o profile.mobileconfig
+          grep -q 'minichat-device-profile/callback' profile.mobileconfig
+          grep -q '<string>UDID</string>' profile.mobileconfig
