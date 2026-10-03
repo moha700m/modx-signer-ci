@@ -8,7 +8,18 @@ from typing import Any
 import xsign_worker as worker
 
 _SIGNED_METADATA: dict[str, str] = {}
+_original_client_init = worker.XSignClient.__init__
 _original_inspect_and_remap = worker.inspect_and_remap
+
+
+def client_init_with_appdeploy_oidc(
+    self: worker.XSignClient,
+    max_retry_seconds: float = worker.RETRY_MAX_DURATION_SECONDS,
+) -> None:
+    _original_client_init(self, max_retry_seconds=max_retry_seconds)
+    authorization = self.s.headers.pop('Authorization', None)
+    if authorization and authorization.startswith('Bearer '):
+        self.s.headers['X-XSign-GitHub-OIDC'] = authorization[7:]
 
 
 def inspect_and_remap(ipa: Path, work: Path, bundle_prefix: str):
@@ -58,6 +69,7 @@ def complete_with_install_metadata(
     self.request('POST', f'/api/worker/jobs/{job_id}/complete', json_body=payload)
 
 
+worker.XSignClient.__init__ = client_init_with_appdeploy_oidc
 worker.inspect_and_remap = inspect_and_remap
 worker.XSignClient.complete = complete_with_install_metadata
 
