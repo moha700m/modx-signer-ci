@@ -34,17 +34,19 @@ class WorkflowYamlTests(unittest.TestCase):
         self.assertEqual(concurrency.get('group'), 'xsign-signing-worker')
         self.assertFalse(concurrency.get('cancel-in-progress'))
 
-    def test_worker_workflow_uses_macos_and_configurable_url(self) -> None:
+    def test_worker_workflow_uses_macos_appdeploy_and_fast_bridge(self) -> None:
         text = (REPO_ROOT / '.github' / 'workflows' / 'xsign-worker.yml').read_text()
         self.assertIn('macos-15', text)
-        self.assertIn('vars.XSIGN_SUPABASE_BASE_URL', text)
-        self.assertNotIn('https://api-v2.appdeploy.ai/app/xsign-0xcfp9', text,
-                         'XSIGN_BASE_URL must come from a variable, not a hardcoded URL')
+        self.assertIn('https://xsign-0xcfp9.v2.appdeploy.ai', text)
+        self.assertIn('xsign_fast_worker.py --health-check', text)
+        self.assertIn('xsign_fast_worker.py --max-jobs 10', text)
+        self.assertIn('sleep_for=5', text)
+        self.assertNotIn('gbvopmtmzosqknntaafl.supabase.co', text)
 
 
 class PythonLintTests(unittest.TestCase):
     def test_python_sources_compile(self) -> None:
-        for name in ('xsign_worker.py', 'worker.py'):
+        for name in ('xsign_worker.py', 'xsign_fast_worker.py', 'worker.py'):
             with self.subTest(file=name):
                 py_compile.compile(str(REPO_ROOT / name), doraise=True)
 
