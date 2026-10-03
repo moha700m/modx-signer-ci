@@ -37,7 +37,7 @@ class WorkflowYamlTests(unittest.TestCase):
     def test_worker_workflow_uses_macos_appdeploy_and_fast_bridge(self) -> None:
         text = (REPO_ROOT / '.github' / 'workflows' / 'xsign-worker.yml').read_text()
         self.assertIn('macos-15', text)
-        self.assertIn('https://xsign-0xcfp9.v2.appdeploy.ai', text)
+        self.assertIn('https://api-v2.appdeploy.ai/app/xsign-0xcfp9', text)
         self.assertIn('xsign_fast_worker.py --health-check', text)
         self.assertIn('xsign_fast_worker.py --max-jobs 10', text)
         self.assertIn('sleep_for=5', text)
