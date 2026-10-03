@@ -25,7 +25,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     env:
-      XSIGN_BASE_URL: https://xsign-0xcfp9.v2.appdeploy.ai
+      XSIGN_BASE_URL: https://api-v2.appdeploy.ai/app/xsign-0xcfp9
       APPLE_BUNDLE_PREFIX: ${{ vars.APPLE_BUNDLE_PREFIX || 'com.moha700m.xsign' }}
       XSIGN_PORTAL_HOST: ${{ vars.XSIGN_PORTAL_HOST }}
 
@@ -117,7 +117,7 @@ jobs:
             else
               echo "- XSign health: **unavailable (deferred)**"
             fi
-            echo "- Backend: **AppDeploy XSign**"
+            echo "- Backend: **AppDeploy XSign API proxy**"
             echo "- Schedule fallback: every 5 minutes (cron \`*/5 * * * *\`)"
             echo "- Manual/immediate dispatch: enabled (workflow_dispatch)"
             echo "- Warm queue polling: every 5 seconds"
