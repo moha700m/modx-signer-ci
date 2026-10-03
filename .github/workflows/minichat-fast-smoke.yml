@@ -1,0 +1,41 @@
+name: Minichat Fast Smoke
+on:
+  push:
+    branches: [minichat-fast-install]
+  workflow_dispatch:
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check backend health
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 3 --max-time 30 \
+            https://gbvopmtmzosqknntaafl.supabase.co/functions/v1/minichat-fast-api/health \
+            -o health.json
+          cat health.json
+          python - <<'PY'
+          import json
+          x=json.load(open('health.json'))
+          assert x.get('ok') is True, x
+          assert x.get('appleConfigured') is True, x
+          print('backend-ok')
+          PY
+      - name: Check customer static page
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --max-time 30 \
+            https://raw.githack.com/moha700m/modx-signer-ci/minichat-fast-install/web/index.html \
+            -o page.html
+          grep -q 'تثبيت Minichat' page.html
+          grep -q 'minichat-fast-api' page.html
+          echo static-ok
+      - name: Check admin static page
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --max-time 30 \
+            https://raw.githack.com/moha700m/modx-signer-ci/minichat-fast-install/web/admin.html \
+            -o admin.html
+          grep -q 'رفع نسخة Minichat الأساسية' admin.html
+          grep -q 'tus-js-client' admin.html
+          echo admin-ok
