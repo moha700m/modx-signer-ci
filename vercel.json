@@ -4,6 +4,14 @@
   "trailingSlash": false,
   "rewrites": [
     {
+      "source": "/",
+      "destination": "/web/index.html"
+    },
+    {
+      "source": "/store",
+      "destination": "/web/store.html"
+    },
+    {
       "source": "/api/:path*",
       "destination": "https://gbvopmtmzosqknntaafl.supabase.co/functions/v1/xsign2?path=/api/:path*"
     }
